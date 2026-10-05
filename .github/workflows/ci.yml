@@ -23,7 +23,12 @@ jobs:
       - name: Линтер и форматирование
         run: ruff check . && ruff format --check .
       - name: Тесты
-        run: pytest -q
+        run: |
+          set -o pipefail
+          pytest -q -rf 2>&1 | tee pytest-output.txt
+      - name: Упавшие тесты — в аннотации (видны на странице запуска)
+        if: failure()
+        run: grep -E "^(FAILED|ERROR)|^E " pytest-output.txt | head -10 | sed 's/^/::error::/'
 
   docker:
     runs-on: ubuntu-latest
