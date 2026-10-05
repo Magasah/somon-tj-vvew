@@ -22,3 +22,4 @@ ignore = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["."]  # чтобы `pytest` находил пакет jobbot без установки
