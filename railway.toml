@@ -1,0 +1,12 @@
+# Настройки деплоя на Railway (config as code). Переменные и том задаются в панели Railway.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+# Пересобирать только при изменении кода бота, а не документации или тестов.
+watchPatterns = ["jobbot/**", "requirements.txt", "Dockerfile", "railway.toml"]
+
+[deploy]
+restartPolicyType = "ALWAYS"
+# Между SIGTERM и SIGKILL: бот ждёт конец текущего опроса до 30 секунд.
+drainingSeconds = 40

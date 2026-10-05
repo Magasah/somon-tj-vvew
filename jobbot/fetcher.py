@@ -188,5 +188,11 @@ class Fetcher:
                 continue
             if response.status_code >= 400:
                 raise HttpStatusError(response.status_code, url)
+            if response.history:
+                # Был редирект: итоговый адрес тоже должен быть разрешённой страницей somon.tj.
+                try:
+                    check_url_allowed(str(response.url))
+                except ValueError as exc:
+                    raise FetchError(f"сайт перенаправил на недопустимый адрес: {exc}") from exc
             return response.text
         raise FetchError(f"не удалось загрузить {url}: {last_error}")

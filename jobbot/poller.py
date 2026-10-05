@@ -221,7 +221,7 @@ class Poller:
                 for ad in result.ads
             ]
             matched_ids = {ad.ad_id for ad, ok in items if ok}
-            new = await self._storage.add_ads(items, sent=seeding, now=self._now())
+            new = await self._storage.add_ads(items, skip_sending=seeding, now=self._now())
             stats.new += len(new)
             for ad in new:
                 if ad.ad_id not in matched_ids:
@@ -247,6 +247,7 @@ class Poller:
         sent = await self._notifier.send_ads(
             newest, self._titles, header=format_seed_header(category.title)
         )
+        await self._storage.mark_sent(sent, now=self._now())  # для счётчика в /status
         stats.sent += len(sent)
 
     async def _send_pending(

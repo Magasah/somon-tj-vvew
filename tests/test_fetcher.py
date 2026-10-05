@@ -19,6 +19,7 @@ from jobbot.fetcher import (
 ROBOTS = (Path(__file__).parent / "fixtures" / "robots.txt").read_text(encoding="utf-8")
 URL = DEFAULT_CATEGORIES[0].url
 ROBOTS_URL = "https://somon.tj/robots.txt"
+MOVED = "https://somon.tj/vakansii/it-novyi-adres/"
 
 
 class FakeSleep:
@@ -169,3 +170,25 @@ async def test_missing_robots_means_no_restrictions(sleep: FakeSleep) -> None:
     respx.get(URL).respond(200, text="ok")
     async with make_fetcher(sleep) as fetcher:
         assert await fetcher.fetch_page(URL) == "ok"
+
+
+@respx.mock
+async def test_redirect_inside_site_is_followed(sleep: FakeSleep) -> None:
+    respx.get(ROBOTS_URL).respond(200, text=ROBOTS)
+    respx.get(URL).respond(301, headers={"Location": MOVED})
+    respx.get(MOVED).respond(200, text="ok")
+    async with make_fetcher(sleep) as fetcher:
+        assert await fetcher.fetch_page(URL) == "ok"
+
+
+@pytest.mark.parametrize(
+    "target", ["https://evil.example/vakansii/", "https://somon.tj/vakansii/?ordering=price"]
+)
+@respx.mock
+async def test_redirect_to_forbidden_target_is_rejected(sleep: FakeSleep, target: str) -> None:
+    respx.get(ROBOTS_URL).respond(200, text=ROBOTS)
+    respx.get(URL).respond(302, headers={"Location": target})
+    respx.get(target).respond(200, text="чужая страница")
+    async with make_fetcher(sleep) as fetcher:
+        with pytest.raises(FetchError, match="перенаправил"):
+            await fetcher.fetch_page(URL)

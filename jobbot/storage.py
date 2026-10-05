@@ -69,6 +69,11 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
 )
 SCHEMA_VERSION = len(MIGRATIONS)
 
+# Значение sent_at для объявлений, которые запомнены без отправки (первый запуск раздела).
+# Не NULL — значит, досылка их не тронет; меньше любой реальной даты — значит, в счётчик
+# «отправлено с …» они не попадут.
+SKIPPED_SENT_AT = "0000-00-00T00:00:00Z"
+
 _DEFAULTS_SEEDED = "defaults_seeded"
 
 
@@ -182,17 +187,18 @@ class Storage:
         self,
         items: Iterable[tuple[Ad, bool]],
         *,
-        sent: bool = False,
+        skip_sending: bool = False,
         now: datetime | None = None,
     ) -> list[Ad]:
         """Сохранить объявления (`INSERT OR IGNORE`) и вернуть только действительно новые.
 
         items — пары (объявление, прошло ли фильтр). Уже известный `ad_id` не меняется и
-        в результат не попадает. `sent=True` сразу помечает объявления отправленными —
-        так сохраняются объявления первого запуска, которые слать не нужно.
+        в результат не попадает. `skip_sending=True` — объявления первого запуска: они
+        запоминаются как обработанные (`sent_at = SKIPPED_SENT_AT`) и никогда не отправляются,
+        но и не считаются «отправленными сегодня» в /status.
         """
         stamp = to_iso(now)
-        sent_at = stamp if sent else None
+        sent_at = SKIPPED_SENT_AT if skip_sending else None
         new: list[Ad] = []
         async with self._tx() as db:
             for ad, matched in items:

@@ -514,3 +514,14 @@ async def test_failed_alert_delivery_does_not_break_polling(env: Env) -> None:
     assert stats is not None
     assert await env.storage.get_state("blocked_until")
     assert await env.storage.get_state("block_alerted") is None  # не доставлено → повторим позже
+
+
+async def test_seed_counts_only_really_sent_in_status_counter(env: Env) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    env.fetcher.set(IT.url, page(*ads_range(1, 10)))
+    await env.poller.poll_once()
+    today = datetime.now(UTC) - timedelta(hours=1)
+    # 10 объявлений запомнено, но «отправлено» только 3 карточки seed
+    assert await env.storage.count_ads() == 10
+    assert await env.storage.count_sent_since(today) == 3

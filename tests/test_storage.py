@@ -107,7 +107,7 @@ async def test_unsent_then_mark_sent(storage: Storage) -> None:
 
 
 async def test_seeded_ads_saved_as_sent(storage: Storage) -> None:
-    await storage.add_ads([(make_ad(1), True)], sent=True, now=NOW)
+    await storage.add_ads([(make_ad(1), True)], skip_sending=True, now=NOW)
     assert await storage.unsent_matched(NOW - timedelta(days=1)) == []
     # но в /last они видны
     assert [a.ad_id for a in await storage.recent_matched(5)] == [1]

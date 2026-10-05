@@ -133,7 +133,7 @@ async def add_ads(storage: Storage, count: int, matched: bool = True) -> None:
         )
         for i in range(1, count + 1)
     ]
-    await storage.add_ads([(ad, matched) for ad in ads], sent=True)
+    await storage.add_ads([(ad, matched) for ad in ads], skip_sending=True)
 
 
 # ---------- доступ ----------
