@@ -1,0 +1,17 @@
+services:
+  bot:
+    build: .
+    container_name: somon-job-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /app/data/jobbot.db  # база лежит в смонтированной папке и переживает перезапуск
+    volumes:
+      - ./data:/app/data
+    mem_limit: 150m
+    stop_grace_period: 40s  # бот ждёт конец текущего опроса до 30 секунд
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

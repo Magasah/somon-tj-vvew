@@ -1,0 +1,22 @@
+# секреты
+.env
+
+# данные и логи
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# редакторы и ОС
+.idea/
+.vscode/
+.DS_Store

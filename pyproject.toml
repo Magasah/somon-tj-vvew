@@ -1,0 +1,24 @@
+[project]
+name = "somon-job-bot"
+version = "0.1.0"
+description = "Telegram-бот уведомлений о новых вакансиях с somon.tj"
+requires-python = ">=3.12"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S", "RUF"]
+ignore = [
+    "RUF001",  # кириллица в строках — это нормально
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]  # assert в тестах разрешён
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
