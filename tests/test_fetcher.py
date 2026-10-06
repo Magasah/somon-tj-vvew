@@ -192,3 +192,29 @@ async def test_redirect_to_forbidden_target_is_rejected(sleep: FakeSleep, target
     async with make_fetcher(sleep) as fetcher:
         with pytest.raises(FetchError, match="перенаправил"):
             await fetcher.fetch_page(URL)
+
+
+AD_URL = "https://somon.tj/adv/16556274_net-backend-developer/"
+
+
+@respx.mock
+async def test_fetch_detail_ok(sleep: FakeSleep) -> None:
+    respx.get(ROBOTS_URL).respond(200, text=ROBOTS)
+    respx.get(AD_URL).respond(200, text="<html>ad</html>")
+    async with make_fetcher(sleep) as fetcher:
+        assert await fetcher.fetch_detail(AD_URL) == "<html>ad</html>"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example/adv/1_x/",
+        "https://somon.tj/vakansii/it/",
+        "https://somon.tj/adv/1_x/?attrs__a=1",
+        "https://somon.tj/adv/1_a---b/",
+    ],
+)
+async def test_fetch_detail_rejects_bad_urls(sleep: FakeSleep, url: str) -> None:
+    async with make_fetcher(sleep) as fetcher:
+        with pytest.raises(ValueError):
+            await fetcher.fetch_detail(url)
