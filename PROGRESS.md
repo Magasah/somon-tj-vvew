@@ -13,14 +13,14 @@
 
 ## Текущий статус
 
-- **Этап:** v1.1 «фильтры через кнопки» — 9.1 готов, далее 9.2. Работа в ветке `feature/filters`. v1.0 (этапы 0–8) работает в проде
-- **Готово этапов:** v1.0: 9 из 9 (0–8); v1.1: 1 из 9 (9.1)
+- **Этап:** v1.1 «фильтры через кнопки» — 9.2 готов, далее 9.3. Ветка `feature/filters`. v1.0 (этапы 0–8) работает в проде
+- **Готово этапов:** v1.0: 9 из 9 (0–8); v1.1: 2 из 9 (9.1–9.2)
 - **Последнее обновление:** 2026-10-06
 - **Бот запущен в проде:** да — Railway, проект `charismatic-vitality`, сервис `somon-tj-vvew`, том `/app/data`; бот `@somontjvvew_bot`
 
 ## Следующий шаг
 
-9.2 (раздел 8 `TZ_update_filters.md`, модель — раздел 4): `jobbot/catalog.py` (26 категорий, слаги ровно как в ТЗ), `jobbot/filters.py` (`SalaryFilter`, `FilterProfile` + валидация, откат к умолчанию при битых данных), миграция базы v2 (`MIGRATIONS[1]`: новые столбцы `ads`, `filter_profile`, `attr_values`, индекс `idx_ads_details`, перенос включённых `categories` → профиль) с автобэкапом `data/backups/jobbot-<UTC>.db` перед миграцией, настройки `VISIBLE_CATEGORIES` и `MAX_DETAILS_PER_CYCLE` в `config.py` и `.env.example`. Тест: копия базы v1 с данными → миграция → данные на месте, профиль из старых категорий; повторный запуск ничего не меняет.
+9.3 (раздел 5 `TZ_update_filters.md`): `jobbot/normalize.py` (нижний регистр, `ё ӣ ӯ ҳ қ ғ ҷ` → `е и у х к г ч`, убрать скобки, схлопнуть пробелы и дефисы; словарь синонимов городов `куляб→кулоб`, `курган-тюбе→бохтар`, `ленинабад→худжанд`), `parse_salary(text) -> Salary` (≥15 тестов: VIP/ТОП/TOP/Срочно в начале, латинская/кириллическая «c», неразрывные пробелы, «от»/«до», диапазон через `-`/`–`, «Договорная», нераспознанное → None + WARNING), город в карточке (`city_norm`), `parse_detail(html) -> AdDetails` по селекторам из «Заметок по парсеру» + тесты на 3 фикстурах `detail_*.html`. После появления `normalize` — дописать в `_migration_v2` заполнение `city_norm` для старых объявлений (миграция ещё не выпущена).
 
 Поддержка v1.0 (не забыть): владелец перевыпускает токен у @BotFather (`/revoke`) и обновляет его в Railway и `.env`.
 
@@ -41,7 +41,7 @@
 | 8 | Документация | ✅ готов | `README.md` на русском (+ раздел Railway). Критерий «запуск за 15 минут» без опытного человека не проверялся |
 | **v1.1** | **Фильтры через кнопки** (`TZ_update_filters.md`) | | |
 | 9.1 | Исследование реального HTML | ✅ готов | 30 страниц объявлений (15 it + 15 students) скачано через `Fetcher.fetch_detail`; 3 фикстуры `tests/fixtures/detail_*.html`; значения и селекторы — в «Заметках по парсеру»; `test_detail_page_selectors` проверяет селекторы на фикстурах; `pytest` 201 passed |
-| 9.2 | Каталог, модель, миграция v2 | ⬜ | — |
+| 9.2 | Каталог, модель, миграция v2 | ✅ готов | `tests/test_migration.py`: база v1 с данными → v2: старые данные (ads/keywords/state) байт-в-байт, профиль из включённых категорий, копия в `backups/`; повторный запуск ничего не меняет и не делает второй копии; `tests/test_filters.py` — каталог, настройки, модель; `pytest` 240 passed |
 | 9.3 | Парсинг v2 (нормализация, зарплата, детали) | ⬜ | — |
 | 9.4 | Отбор v2 (двухступенчатый) | ⬜ | — |
 | 9.5 | Опрос v2 (категории, очередь деталей) | ⬜ | — |
@@ -70,7 +70,7 @@
 | `.env.example` | Шаблон конфига (без секретов) |
 | `jobbot/__init__.py` | Пакет |
 | `jobbot/__main__.py` | Точка входа: `--dry-run` (печать стр. 1 без базы/Telegram), `--once` (один опрос + выход), без флагов — `_serve`: опрос + приём команд, проверка токена (`getMe`), остановка по SIGINT/SIGTERM с ожиданием до 30 с |
-| `jobbot/config.py` | `Settings` (pydantic-settings), `load_settings()`, `DEFAULT_CATEGORIES`, `DEFAULT_INCLUDE/EXCLUDE`, `USER_AGENT` |
+| `jobbot/config.py` | `Settings` (pydantic-settings), `load_settings()`; разделы строятся из каталога по `VISIBLE_CATEGORIES` (`settings.categories`, `visible_keys`), `MAX_DETAILS_PER_CYCLE`; `DEFAULT_CATEGORIES`, `DEFAULT_INCLUDE/EXCLUDE`, `USER_AGENT` |
 | `jobbot/logging_setup.py` | `setup_logging()`, `SafeFormatter` (время по TZ + маскировка токена), `mask_secrets()` |
 | `jobbot/bot/__init__.py` | Пакет Telegram-части |
 | `jobbot/bot/middleware.py` | `OwnerOnlyMiddleware`: пропускает только `OWNER_CHAT_ID`, чужим — молчание + WARNING |
@@ -82,11 +82,13 @@
 | `docker-compose.yml` | `restart: unless-stopped`, `env_file: .env`, volume `./data`, `mem_limit: 150m`, `stop_grace_period: 40s` |
 | `.dockerignore` | Не пускает в образ `.env`, `data/`, `tests/`, `*.md` |
 | `README.md` | Инструкция для владельца на русском |
+| `jobbot/catalog.py` | Каталог 26 разделов (`CATALOG`, `CATALOG_BY_KEY`, слаги как на сайте), `parse_category_keys`, `SITE_URL`, `DEFAULT_VISIBLE` |
+| `jobbot/filters.py` | `SalaryFilter`, `FilterProfile` (валидация, лимиты, `needs_details`), `load_profile` (битые данные → умолчание + WARNING), `dump_profile` |
 | `jobbot/models.py` | `Ad` — frozen dataclass объявления (раздел 3.1 ТЗ) |
 | `jobbot/fetcher.py` | `Fetcher` (httpx, ≥3 с между запросами, повторы 2/4/8 с, 403/429 → `BlockedError`, robots.txt с кешем 24 ч, проверка адреса после редиректа), `fetch_page`, `fetch_detail` (страница объявления), `build_page_url`, `check_url_allowed` |
 | `jobbot/parser.py` | `parse_listing` (основной), `parse_listing_fallback` (запасной), `parse_page` → `ParseResult(ads, simplified)` |
 | `jobbot/matcher.py` | `normalize()`, `contains_word()`, `matches(text, mode, include, exclude)`, `validate_keyword()` (+ лимиты слов) |
-| `jobbot/storage.py` | `Storage` (aiosqlite, WAL, миграции `MIGRATIONS`): `add_ads`, `mark_sent`, `unsent_matched`, `recent_matched`, `has_ads`, `count_*`, ключевые слова, разделы, `seed_defaults`, `state` |
+| `jobbot/storage.py` | `Storage` (aiosqlite, WAL, миграции `MIGRATIONS` = функции v1, v2; копия базы `backup_database` перед миграцией): объявления, ключевые слова, разделы, `seed_defaults`, `state`, профиль фильтров (`get_filter_profile`, `update_profile`) |
 | `jobbot/notifier.py` | `format_card`, `card_keyboard`, `format_seed_header`, `format_digest`, `Notifier` (`send_text`, `send_ads` → список доставленных `ad_id`; пауза ≥1 с, повтор на `TelegramRetryAfter`) |
 | `jobbot/poller.py` | `Poller`: `poll_once()` (под `asyncio.Lock`, None если уже идёт), `run_forever(stop)`, `next_delay()`, `flush_unsent(since)`; seed, многостраничность, пауза, пауза 30 мин после 403/429, самодиагностика и служебные уведомления (`_alert`) |
 | `tests/fixtures/it_page1.html`, `students_page1.html` | Реальные страницы разделов (скачаны 2026-10-05) |
@@ -102,6 +104,8 @@
 | `tests/manual_send_card.py` | Ручная проверка: шлёт владельцу тестовые карточки (нужен `.env`; pytest его не запускает) |
 | `tests/test_bot.py` | Команды через настоящий `Dispatcher` с подменой сессии Telegram: доступ, слова, разделы, `/last`, пауза, `/status`, `/check` |
 | `tests/test_main.py` | `_serve`: опрос и приём команд работают вместе, останавливаются по `stop` |
+| `tests/test_migration.py` | Миграция v1 → v2 на копии базы v1 с данными, бэкап, идемпотентность, профиль в базе |
+| `tests/test_filters.py` | Каталог, настройки v1.1, модель `FilterProfile` |
 | `tests/test_poller.py` | Тесты poller: seed, дубли, новые, фильтры, страницы, пауза, сбои отправки, ошибки, блокировка, lock, самодиагностика и уведомления |
 | `tests/test_fetcher.py` | Тесты fetcher через respx: задержка, повторы, 403/429, robots |
 
@@ -217,6 +221,11 @@ docker compose restart
 - 2026-10-05 · Fetcher: после редиректа итоговый URL проверяется `check_url_allowed` (только somon.tj, без запрещённых путей и параметров), иначе `FetchError` · `follow_redirects=True` из ТЗ сохранён.
 - 2026-10-05 · `pyproject.toml`: `pythonpath = ["."]` — без этого голый `pytest` на Linux (CI) не видел пакет `jobbot` (локально работал `python -m pytest`).
 - 2026-10-05 · Railway: `RAILWAY_RUN_UID=0` (иначе пользователь uid 1000 не может писать в том Railway; в CI и docker-compose контейнер остаётся не-root). Том `/app/data` создан через CLI.
+- 2026-10-06 · Разделы для опроса теперь строятся из каталога по `VISIBLE_CATEGORIES` (`settings.categories` — свойство, а не поле); `DEFAULT_CATEGORIES` = it, students с теми же URL, что в v1.0 — поведение по умолчанию не изменилось. Старый способ «добавить строку в DEFAULT_CATEGORIES» больше не работает — README обновлён.
+- 2026-10-06 · Миграции — список async-функций (v1 = прежний SQL, v2 = новые столбцы/таблицы + перенос). `ALTER TABLE ADD COLUMN` выполняется только для отсутствующих столбцов (`PRAGMA table_info`) — миграция переживает частично применённое состояние. Перенос: включённые разделы из `categories` (только ключи каталога) → `FilterProfile.categories`; если ни одного — профиль по умолчанию. `INSERT OR IGNORE` — существующий профиль не перезаписывается.
+- 2026-10-06 · Копия перед миграцией: только если в базе уже есть схема (версия ≥1) и она старше кода; `<папка базы>/backups/<имя>-YYYYMMDDTHHMMSSZ.db` через `sqlite3.backup` (целостно в WAL). Свежая база копию не делает. На Railway копия ляжет на том `/app/data/backups/`.
+- 2026-10-06 · `FilterProfile`: требуется ≥1 категория (ТЗ 7.3 «нельзя снять последнюю»), значения городов/графика/стажа — без пустых и повторов, ≤60 символов; лишние поля в JSON игнорируются (совместимость с будущими версиями). Менять профиль — только через `Storage.update_profile(mutator)` (лок + транзакция + повторная валидация; ошибка → откат).
+- 2026-10-06 · `MAX_DETAILS_PER_CYCLE` ограничен 1–30 (по 3 с на запрос — до 90 с на цикл).
 - 2026-10-06 · v1.1 ведётся в ветке `feature/filters` (ТЗ 9.9); ТЗ-обновление скопировано в репозиторий как `TZ_update_filters.md`.
 - 2026-10-06 · `Fetcher.fetch_detail(url)` — страница объявления через ту же очередь (≥3 с, robots.txt, проверка `check_url_allowed`); принимает только `https://somon.tj/adv/...` без query. Добавлен на 9.1 для исследования, используется на 9.5.
 - 2026-10-05 · Первый запуск сохраняет текущие объявления без отправки (кроме `SEED_SEND_LAST`) · защита от спама сотнями старых вакансий.
@@ -227,6 +236,7 @@ docker compose restart
 
 > Формат: `- [ ] описание · где · приоритет (высокий/средний/низкий)`
 
+- [ ] `city_norm` для объявлений, сохранённых до v1.1, пуст — заполнить в `_migration_v2`, когда появится `normalize.py` (9.3) · 9.3 · низкий
 - [ ] Стаж «Любой» — значение сайта, совпадает по тексту с кнопкой «Любой» (= фильтр выкл.) из ТЗ 7.3; на 9.6 подписать по-разному · 9.6 · средний
 - [ ] ТЗ 9.9 описывает деплой через `docker compose` на сервере, а прод — Railway (том `/app/data`, `railway up`); бэкап базы перед миграцией делать через `railway ssh`/том — уточнить на 9.9 · 9.9 · средний
 
@@ -253,6 +263,12 @@ docker compose restart
 > - Файлы: …
 > - Проверка: команда → ожидаемый результат
 > - Заметки: …
+
+### 2026-10-06 · v1.1 · 9.2 Каталог, модель, миграция v2
+- Сделано: `catalog.py` (26 разделов), `filters.py` (`SalaryFilter`, `FilterProfile`, `load_profile`/`dump_profile`), настройки `VISIBLE_CATEGORIES`/`MAX_DETAILS_PER_CYCLE` (+ `.env.example`, README), миграция базы до версии 2 с автоматической копией, `Storage.get_filter_profile`/`update_profile`.
+- Файлы: `jobbot/catalog.py`, `jobbot/filters.py`, `jobbot/config.py`, `jobbot/storage.py`, `.env.example`, `pyproject.toml` (E501 для таблицы каталога), `README.md`, `tests/test_migration.py`, `tests/test_filters.py`.
+- Проверка: `pytest` → 240 passed (было 201); `ruff check .`/`ruff format --check .` → чисто. Старые тесты v1.0 не менялись и проходят.
+- Заметки: опрос пока использует видимые разделы и старую таблицу `categories`; переход на профиль — на 9.5.
 
 ### 2026-10-06 · v1.1 · 9.1 Исследование реального HTML
 - Сделано: в PROGRESS добавлены этапы 9.1–9.9, ТЗ-обновление скопировано в `TZ_update_filters.md`, создана ветка `feature/filters`. Добавлен `Fetcher.fetch_detail`. Скачано через него 2 страницы списков и 30 страниц объявлений (пауза 3 с, последовательно; ~100 с). 3 страницы сохранены в фикстуры (токен Mapbox и телефоны вычищены). Значения, селекторы и форматы — в «Заметках по парсеру».

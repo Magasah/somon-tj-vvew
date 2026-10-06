@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Iterable, Sequence
-from contextlib import asynccontextmanager
+import sqlite3
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,7 +19,9 @@ from typing import Literal
 
 import aiosqlite
 
+from jobbot.catalog import CATALOG_BY_KEY
 from jobbot.config import Category
+from jobbot.filters import FilterProfile, dump_profile, load_profile
 from jobbot.matcher import normalize
 from jobbot.models import Ad
 
@@ -26,10 +29,9 @@ log = logging.getLogger("storage")
 
 KeywordKind = Literal["include", "exclude"]
 
-# Миграции: номер версии = индекс + 1. Каждая — кортеж SQL-команд, применяется в транзакции.
-MIGRATIONS: tuple[tuple[str, ...], ...] = (
-    (  # версия 1 — схема из раздела 7 ТЗ
-        """
+# Версия 1 — схема из раздела 7 ТЗ.
+_V1_SQL: tuple[str, ...] = (
+    """
         CREATE TABLE IF NOT EXISTS ads (
             ad_id         INTEGER PRIMARY KEY,
             category_key  TEXT    NOT NULL,
@@ -43,29 +45,93 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = (
             sent_at       TEXT
         )
         """,
-        "CREATE INDEX IF NOT EXISTS idx_ads_category ON ads(category_key)",
-        "CREATE INDEX IF NOT EXISTS idx_ads_seen ON ads(first_seen_at)",
-        """
+    "CREATE INDEX IF NOT EXISTS idx_ads_category ON ads(category_key)",
+    "CREATE INDEX IF NOT EXISTS idx_ads_seen ON ads(first_seen_at)",
+    """
         CREATE TABLE IF NOT EXISTS keywords (
             kind TEXT NOT NULL CHECK (kind IN ('include', 'exclude')),
             word TEXT NOT NULL,
             PRIMARY KEY (kind, word)
         )
         """,
-        """
+    """
         CREATE TABLE IF NOT EXISTS categories (
             key     TEXT PRIMARY KEY,
             enabled INTEGER NOT NULL DEFAULT 1,
             mode    TEXT NOT NULL DEFAULT 'all' CHECK (mode IN ('all', 'keywords'))
         )
         """,
-        """
+    """
         CREATE TABLE IF NOT EXISTS state (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         )
         """,
-    ),
+)
+
+# Версия 2 (v1.1, фильтры через кнопки) — раздел 4.2 TZ_update_filters.md.
+# Столбцы добавляются только если их ещё нет: миграция переживает повторный запуск.
+_V2_ADS_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("salary_min", "INTEGER"),
+    ("salary_max", "INTEGER"),
+    ("salary_negotiable", "INTEGER NOT NULL DEFAULT 0"),
+    ("city_norm", "TEXT"),
+    ("schedule", "TEXT"),  # исходный текст с сайта
+    ("experience", "TEXT"),
+    ("company", "TEXT"),
+    ("sphere", "TEXT"),
+    ("details_status", "TEXT NOT NULL DEFAULT 'none'"),  # none|pending|ok|failed|skipped
+    ("details_attempts", "INTEGER NOT NULL DEFAULT 0"),
+)
+_V2_SQL: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_ads_details ON ads(details_status)",
+    """
+    CREATE TABLE IF NOT EXISTS filter_profile (
+        id   INTEGER PRIMARY KEY CHECK (id = 1),
+        data TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS attr_values (
+        attr       TEXT NOT NULL CHECK (attr IN ('city', 'schedule', 'experience')),
+        value_norm TEXT NOT NULL,
+        label      TEXT NOT NULL,
+        seen_count INTEGER NOT NULL DEFAULT 1,
+        last_seen  TEXT NOT NULL,
+        PRIMARY KEY (attr, value_norm)
+    )
+    """,
+)
+
+
+async def _migration_v1(db: aiosqlite.Connection) -> None:
+    for statement in _V1_SQL:
+        await db.execute(statement)
+
+
+async def _migration_v2(db: aiosqlite.Connection) -> None:
+    cursor = await db.execute("PRAGMA table_info(ads)")
+    existing = {row[1] for row in await cursor.fetchall()}
+    for name, declaration in _V2_ADS_COLUMNS:
+        if name not in existing:
+            # Имя и тип — константы из кода выше, не данные пользователя.
+            await db.execute(f"ALTER TABLE ads ADD COLUMN {name} {declaration}")
+    for statement in _V2_SQL:
+        await db.execute(statement)
+
+    # Перенос старых настроек: включённые разделы из `categories` → профиль фильтров.
+    cursor = await db.execute("SELECT key FROM categories WHERE enabled = 1 ORDER BY rowid")
+    keys = [row[0] for row in await cursor.fetchall() if row[0] in CATALOG_BY_KEY]
+    profile = FilterProfile(categories=keys) if keys else FilterProfile()
+    await db.execute(
+        "INSERT OR IGNORE INTO filter_profile (id, data) VALUES (1, ?)", (dump_profile(profile),)
+    )
+
+
+# Миграции по порядку: номер версии = индекс + 1. Каждая выполняется в общей транзакции.
+MIGRATIONS: tuple[Callable[[aiosqlite.Connection], Awaitable[None]], ...] = (
+    _migration_v1,
+    _migration_v2,
 )
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -124,6 +190,9 @@ class Storage:
             await db.execute("PRAGMA busy_timeout = 5000")
             await db.execute("PRAGMA synchronous = NORMAL")
             storage = cls(db)
+            current = await storage.schema_version()
+            if str(path) != ":memory:" and 0 < current < SCHEMA_VERSION:
+                await backup_database(Path(path))
             await storage._migrate()
         except BaseException:
             await db.close()
@@ -172,14 +241,48 @@ class Storage:
                 )
             for version in range(current + 1, SCHEMA_VERSION + 1):
                 log.info("миграция базы: версия %d", version)
-                for statement in MIGRATIONS[version - 1]:
-                    await db.execute(statement)
+                await MIGRATIONS[version - 1](db)
                 await db.execute("DELETE FROM schema_version")
                 await db.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
 
     async def schema_version(self) -> int:
+        """Текущая версия схемы (0 — база пустая, таблицы версий ещё нет)."""
+        exists = await self._fetchone(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
+        )
+        if exists is None:
+            return 0
         row = await self._fetchone("SELECT MAX(version) FROM schema_version")
         return row[0] if row and row[0] is not None else 0
+
+    # ---------- профиль фильтров (v1.1) ----------
+
+    async def get_filter_profile(self) -> FilterProfile:
+        row = await self._fetchone("SELECT data FROM filter_profile WHERE id = 1")
+        return load_profile(row["data"] if row else None)
+
+    async def update_profile(
+        self, mutator: Callable[[FilterProfile], FilterProfile | None]
+    ) -> FilterProfile:
+        """Единственный способ менять профиль: прочитать → изменить → проверить → записать.
+
+        Всё под общей блокировкой и в одной транзакции, поэтому быстрые двойные нажатия
+        кнопок не теряют изменения. `mutator` получает копию профиля и может менять её
+        на месте или вернуть новый профиль. Недопустимый результат → ValidationError,
+        в базе ничего не меняется.
+        """
+        async with self._tx() as db:
+            cursor = await db.execute("SELECT data FROM filter_profile WHERE id = 1")
+            row = await cursor.fetchone()
+            draft = load_profile(row["data"] if row else None).model_copy(deep=True)
+            changed = mutator(draft) or draft
+            profile = FilterProfile.model_validate(changed.model_dump())
+            await db.execute(
+                "INSERT INTO filter_profile (id, data) VALUES (1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                (dump_profile(profile),),
+            )
+        return profile
 
     # ---------- объявления ----------
 
@@ -358,3 +461,27 @@ class Storage:
 def from_iso(value: str) -> datetime:
     """Обратное к `to_iso`: строка `2026-10-05T14:05:12Z` → datetime в UTC."""
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+
+async def backup_database(db_path: Path, *, now: datetime | None = None) -> Path:
+    """Копия базы перед миграцией: `<папка базы>/backups/<имя>-<UTC-время>.db`.
+
+    Используется встроенный механизм резервного копирования SQLite — копия целостная,
+    даже если база в режиме WAL.
+    """
+    backup_dir = db_path.parent / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = (now or datetime.now(UTC)).strftime("%Y%m%dT%H%M%SZ")
+    target = backup_dir / f"{db_path.stem}-{stamp}.db"
+    suffix = 1
+    while target.exists():
+        target = backup_dir / f"{db_path.stem}-{stamp}-{suffix}.db"
+        suffix += 1
+    await asyncio.to_thread(_copy_sqlite, db_path, target)
+    log.info("копия базы перед миграцией: %s", target)
+    return target
+
+
+def _copy_sqlite(source: Path, target: Path) -> None:
+    with closing(sqlite3.connect(source)) as src, closing(sqlite3.connect(target)) as dst:
+        src.backup(dst)

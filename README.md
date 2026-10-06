@@ -51,6 +51,8 @@ OWNER_CHAT_ID=123456789
 | `DB_PATH` | `data/jobbot.db` | Где лежит база |
 | `LOG_LEVEL` | INFO | Подробность логов |
 | `TZ` | Asia/Dushanbe | Часовой пояс для логов и `/status` |
+| `VISIBLE_CATEGORIES` | it,students | Какие разделы somon.tj видны в боте (см. раздел 7) |
+| `MAX_DETAILS_PER_CYCLE` | 10 | Сколько страниц объявлений открывать за цикл для фильтров «График»/«Стаж» (1–30) |
 
 `.env` в git не попадает (он в `.gitignore`). Не отправляйте его другим людям.
 
@@ -155,22 +157,21 @@ Railway сам соберёт образ по `Dockerfile` (файл `docker-com
 По умолчанию оба раздела в режиме `all`. Чтобы получать только программистские вакансии,
 откройте `/categories` и переключите режим на `keywords`.
 
-## 7. Как добавить свой раздел
+## 7. Как открыть другой раздел
 
-1. Откройте нужный раздел вакансий на somon.tj и скопируйте адрес без параметров, например
-   `https://somon.tj/vakansii/prodazhi/`. Адрес не должен содержать `?ordering=`, `price_min` и т.п.
-   (они запрещены в `robots.txt`).
-2. В файле `jobbot/config.py` добавьте строку в `DEFAULT_CATEGORIES`:
+Все 26 разделов вакансий somon.tj уже есть в каталоге `jobbot/catalog.py`. Какие из них видит бот,
+задаёт строка `VISIBLE_CATEGORIES` в `.env` (на Railway — во вкладке Variables):
 
-   ```python
-   DEFAULT_CATEGORIES = (
-       # ... существующие разделы ...
-       Category(key="sales", title="Продажи", url=f"{BASE_URL}/vakansii/prodazhi/"),
-   )
-   ```
+```
+VISIBLE_CATEGORIES=it,students,sales
+```
 
-3. Перезапустите бота (`docker compose up -d --build` или `python -m jobbot`).
-   Новый раздел появится в `/categories`, а при первом опросе сработает «тихий» старт (без спама).
+Ключи разделов: `admin`, `finance`, `marketing`, `security`, `workers`, `transport`, `agencies`,
+`hr`, `gov`, `medicine`, `sales`, `managers`, `tourism`, `other`, `it`, `domestic`, `students`,
+`production`, `media`, `parttime`, `banks`, `beauty`, `education`, `restaurants`, `construction`,
+`abroad` (названия — в `jobbot/catalog.py`). Код менять не нужно: перезапустите бота, и при первом
+опросе нового раздела сработает «тихий» старт (без спама). Опечатка в ключе — бот не запустится
+и напишет, какие ключи допустимы.
 
 ## 8. Как бот ведёт себя с сайтом
 

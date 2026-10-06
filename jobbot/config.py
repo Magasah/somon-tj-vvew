@@ -9,7 +9,9 @@ from typing import Literal
 from pydantic import SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-BASE_URL = "https://somon.tj"
+from jobbot.catalog import CATALOG_BY_KEY, DEFAULT_VISIBLE, SITE_URL, parse_category_keys
+
+BASE_URL = SITE_URL
 USER_AGENT = "SomonJobAlertBot/1.0 (personal use)"
 
 # Минимальные значения защищают сайт от слишком частых запросов (раздел 2.3 ТЗ).
@@ -19,7 +21,7 @@ MIN_REQUEST_DELAY_SEC = 3
 
 @dataclass(frozen=True)
 class Category:
-    """Раздел вакансий на сайте. Новый раздел = одна строка в DEFAULT_CATEGORIES."""
+    """Раздел вакансий, который опрашивает бот (строится из каталога `jobbot/catalog.py`)."""
 
     key: str
     title: str
@@ -27,17 +29,10 @@ class Category:
     mode: Literal["all", "keywords"] = "all"
 
 
-DEFAULT_CATEGORIES: tuple[Category, ...] = (
-    Category(
-        key="it",
-        title="IT, телеком, компьютеры",
-        url=f"{BASE_URL}/vakansii/it--telekom--kompyuteryi/",
-    ),
-    Category(
-        key="students",
-        title="Начало карьеры, студенты",
-        url=f"{BASE_URL}/vakansii/nachalo-kareryi--studentyi/",
-    ),
+# Разделы, видимые по умолчанию (`VISIBLE_CATEGORIES=it,students`).
+DEFAULT_CATEGORIES: tuple[Category, ...] = tuple(
+    Category(key=key, title=CATALOG_BY_KEY[key].title, url=CATALOG_BY_KEY[key].url)
+    for key in DEFAULT_VISIBLE
 )
 
 DEFAULT_INCLUDE: tuple[str, ...] = (
@@ -68,8 +63,33 @@ class Settings(BaseSettings):
     db_path: str = "data/jobbot.db"
     log_level: str = "INFO"
     tz: str = "Asia/Dushanbe"
+    # v1.1: какие разделы каталога видны в боте (ключи через запятую) и лимит страниц объявлений
+    visible_categories: str = ",".join(DEFAULT_VISIBLE)
+    max_details_per_cycle: int = 10
 
-    categories: tuple[Category, ...] = DEFAULT_CATEGORIES
+    @property
+    def visible_keys(self) -> tuple[str, ...]:
+        return parse_category_keys(self.visible_categories)
+
+    @property
+    def categories(self) -> tuple[Category, ...]:
+        """Видимые разделы в порядке из `VISIBLE_CATEGORIES`."""
+        return tuple(
+            Category(key=key, title=CATALOG_BY_KEY[key].title, url=CATALOG_BY_KEY[key].url)
+            for key in self.visible_keys
+        )
+
+    @field_validator("visible_categories")
+    @classmethod
+    def _check_visible(cls, value: str) -> str:
+        return ",".join(parse_category_keys(value))
+
+    @field_validator("max_details_per_cycle")
+    @classmethod
+    def _check_max_details(cls, value: int) -> int:
+        if not 1 <= value <= 30:
+            raise ValueError("должно быть от 1 до 30")
+        return value
 
     @field_validator("owner_chat_id", mode="before")
     @classmethod
