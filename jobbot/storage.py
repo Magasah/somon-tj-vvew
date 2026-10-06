@@ -24,6 +24,8 @@ from jobbot.config import Category
 from jobbot.filters import FilterProfile, dump_profile, load_profile
 from jobbot.matcher import normalize
 from jobbot.models import Ad
+from jobbot.normalize import normalize_city
+from jobbot.parser import parse_salary
 
 log = logging.getLogger("storage")
 
@@ -118,6 +120,22 @@ async def _migration_v2(db: aiosqlite.Connection) -> None:
             await db.execute(f"ALTER TABLE ads ADD COLUMN {name} {declaration}")
     for statement in _V2_SQL:
         await db.execute(statement)
+
+    # Разобрать зарплату и город у объявлений, сохранённых до v1.1 (для подсчётов в меню).
+    cursor = await db.execute("SELECT ad_id, salary_text, city FROM ads")
+    for ad_id, salary_text, city in await cursor.fetchall():
+        salary = parse_salary(salary_text)
+        await db.execute(
+            "UPDATE ads SET salary_min = ?, salary_max = ?, salary_negotiable = ?, city_norm = ? "
+            "WHERE ad_id = ?",
+            (
+                salary.min,
+                salary.max,
+                int(salary.negotiable),
+                normalize_city(city) if city else None,
+                ad_id,
+            ),
+        )
 
     # Перенос старых настроек: включённые разделы из `categories` → профиль фильтров.
     cursor = await db.execute("SELECT key FROM categories WHERE enabled = 1 ORDER BY rowid")
@@ -305,10 +323,12 @@ class Storage:
         new: list[Ad] = []
         async with self._tx() as db:
             for ad, matched in items:
+                salary = parse_salary(ad.salary_text)
                 cursor = await db.execute(
                     "INSERT OR IGNORE INTO ads (ad_id, category_key, title, url, salary_text, "
-                    "city, date_label, matched, first_seen_at, sent_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "city, date_label, matched, first_seen_at, sent_at, "
+                    "salary_min, salary_max, salary_negotiable, city_norm) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         ad.ad_id,
                         ad.category_key,
@@ -320,6 +340,10 @@ class Storage:
                         int(matched),
                         stamp,
                         sent_at,
+                        salary.min,
+                        salary.max,
+                        int(salary.negotiable),
+                        ad.city_norm,
                     ),
                 )
                 if cursor.rowcount == 1:

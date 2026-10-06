@@ -7,6 +7,8 @@ from collections.abc import Iterable
 from functools import lru_cache
 from typing import Literal
 
+from jobbot.normalize import normalize_text
+
 Mode = Literal["all", "keywords"]
 
 # Слова короче этого порога ищем только как отдельное слово («it», «web», «1с»),
@@ -15,8 +17,12 @@ SHORT_WORD_LEN = 3
 
 
 def normalize(text: str) -> str:
-    """Нижний регистр, `ё` → `е`, лишние пробелы (в том числе неразрывные) схлопнуты."""
-    return " ".join(text.lower().replace("ё", "е").split())
+    """Нижний регистр, `ё`/таджикские буквы → русские, лишние пробелы и дефисы схлопнуты.
+
+    Та же функция, что для городов/графика/стажа (`normalize_text`), но текст в скобках
+    не удаляется: в названии вакансии он бывает важен («Курьер (Python)»).
+    """
+    return normalize_text(text, drop_brackets=False)
 
 
 @lru_cache(maxsize=512)

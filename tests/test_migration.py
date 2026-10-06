@@ -81,12 +81,16 @@ async def test_v1_to_v2_keeps_data_and_creates_profile(tmp_path: Path) -> None:
         keywords_before
     )
     assert table_dump(db_path, "SELECT key, value FROM state ORDER BY key") == state_before
-    # новые столбцы получили значения по умолчанию
+    # зарплата и город старых объявлений разобраны, остальное — значения по умолчанию
     assert table_dump(
         db_path,
-        "SELECT salary_min, salary_max, salary_negotiable, city_norm, schedule, experience, "
-        "company, sphere, details_status, details_attempts FROM ads WHERE ad_id = 1",
-    ) == [(None, None, 0, None, None, None, None, None, "none", 0)]
+        "SELECT ad_id, salary_min, salary_max, salary_negotiable, city_norm, schedule, "
+        "experience, company, sphere, details_status, details_attempts FROM ads ORDER BY ad_id",
+    ) == [
+        (1, 5000, 5000, 0, "душанбе", None, None, None, None, "none", 0),
+        (2, None, None, 1, "худжанд", None, None, None, None, "none", 0),
+        (3, None, None, 0, None, None, None, None, None, "none", 0),
+    ]
     tables = {r[0] for r in table_dump(db_path, "SELECT name FROM sqlite_master")}
     assert {"filter_profile", "attr_values", "idx_ads_details"} <= tables
 

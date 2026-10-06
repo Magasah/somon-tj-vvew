@@ -13,14 +13,14 @@
 
 ## Текущий статус
 
-- **Этап:** v1.1 «фильтры через кнопки» — 9.2 готов, далее 9.3. Ветка `feature/filters`. v1.0 (этапы 0–8) работает в проде
-- **Готово этапов:** v1.0: 9 из 9 (0–8); v1.1: 2 из 9 (9.1–9.2)
+- **Этап:** v1.1 «фильтры через кнопки» — 9.3 готов, далее 9.4. Ветка `feature/filters`. v1.0 (этапы 0–8) работает в проде
+- **Готово этапов:** v1.0: 9 из 9 (0–8); v1.1: 3 из 9 (9.1–9.3)
 - **Последнее обновление:** 2026-10-06
 - **Бот запущен в проде:** да — Railway, проект `charismatic-vitality`, сервис `somon-tj-vvew`, том `/app/data`; бот `@somontjvvew_bot`
 
 ## Следующий шаг
 
-9.3 (раздел 5 `TZ_update_filters.md`): `jobbot/normalize.py` (нижний регистр, `ё ӣ ӯ ҳ қ ғ ҷ` → `е и у х к г ч`, убрать скобки, схлопнуть пробелы и дефисы; словарь синонимов городов `куляб→кулоб`, `курган-тюбе→бохтар`, `ленинабад→худжанд`), `parse_salary(text) -> Salary` (≥15 тестов: VIP/ТОП/TOP/Срочно в начале, латинская/кириллическая «c», неразрывные пробелы, «от»/«до», диапазон через `-`/`–`, «Договорная», нераспознанное → None + WARNING), город в карточке (`city_norm`), `parse_detail(html) -> AdDetails` по селекторам из «Заметок по парсеру» + тесты на 3 фикстурах `detail_*.html`. После появления `normalize` — дописать в `_migration_v2` заполнение `city_norm` для старых объявлений (миграция ещё не выпущена).
+9.4 (раздел 6 `TZ_update_filters.md`): двухступенчатый отбор — новый модуль отбора (ступень 1 по карточке: категория в профиле, город `city_norm` ∈ `cities` или пусто, зарплата — пересечение диапазонов `a_max ≥ f_min и a_min ≤ f_max` с пустыми краями, «Договорная» ↔ `include_negotiable`, нераспознанное ↔ `include_unknown_attrs`, слова include/exclude как сейчас; ступень 2 по `AdDetails`: `schedules`/`experience` по нормализованным значениям, нет значения ↔ `include_unknown_attrs`), `details_status` (`skipped`, если график/стаж не выбраны; иначе `pending`), справочник `attr_values` (`INSERT … ON CONFLICT DO UPDATE seen_count+1, last_seen`). Тесты: каждый фильтр отдельно, комбинация, `include_unknown_attrs` вкл/выкл, «Договорная», ≥6 случаев пересечения диапазонов, детали не нужны без графика/стажа.
 
 Поддержка v1.0 (не забыть): владелец перевыпускает токен у @BotFather (`/revoke`) и обновляет его в Railway и `.env`.
 
@@ -42,7 +42,7 @@
 | **v1.1** | **Фильтры через кнопки** (`TZ_update_filters.md`) | | |
 | 9.1 | Исследование реального HTML | ✅ готов | 30 страниц объявлений (15 it + 15 students) скачано через `Fetcher.fetch_detail`; 3 фикстуры `tests/fixtures/detail_*.html`; значения и селекторы — в «Заметках по парсеру»; `test_detail_page_selectors` проверяет селекторы на фикстурах; `pytest` 201 passed |
 | 9.2 | Каталог, модель, миграция v2 | ✅ готов | `tests/test_migration.py`: база v1 с данными → v2: старые данные (ads/keywords/state) байт-в-байт, профиль из включённых категорий, копия в `backups/`; повторный запуск ничего не меняет и не делает второй копии; `tests/test_filters.py` — каталог, настройки, модель; `pytest` 240 passed |
-| 9.3 | Парсинг v2 (нормализация, зарплата, детали) | ⬜ | — |
+| 9.3 | Парсинг v2 (нормализация, зарплата, детали) | ✅ готов | `tests/test_parsing_v2.py`: 22 случая `parse_salary` (+ пустые и нераспознанные с WARNING, все зарплаты с реальных страниц распознаны), нормализация с таджикскими буквами и синонимами городов, `city_norm` карточки, `parse_detail` на 3 фикстурах + метки/отсутствие/длина; `pytest` 303 passed |
 | 9.4 | Отбор v2 (двухступенчатый) | ⬜ | — |
 | 9.5 | Опрос v2 (категории, очередь деталей) | ⬜ | — |
 | 9.6 | Меню фильтров (кнопки, FSM) | ⬜ | — |
@@ -84,10 +84,11 @@
 | `README.md` | Инструкция для владельца на русском |
 | `jobbot/catalog.py` | Каталог 26 разделов (`CATALOG`, `CATALOG_BY_KEY`, слаги как на сайте), `parse_category_keys`, `SITE_URL`, `DEFAULT_VISIBLE` |
 | `jobbot/filters.py` | `SalaryFilter`, `FilterProfile` (валидация, лимиты, `needs_details`), `load_profile` (битые данные → умолчание + WARNING), `dump_profile` |
-| `jobbot/models.py` | `Ad` — frozen dataclass объявления (раздел 3.1 ТЗ) |
+| `jobbot/normalize.py` | `normalize_text` (регистр, `ё ӣ ӯ ҳ қ ғ ҷ`, скобки, пробелы/дефисы), `normalize_city`, `CITY_SYNONYMS` |
+| `jobbot/models.py` | `Ad` (+ свойство `city_norm`), `Salary` (min/max/negotiable, `known`), `AdDetails` (график, стаж, город, сфера, компания) |
 | `jobbot/fetcher.py` | `Fetcher` (httpx, ≥3 с между запросами, повторы 2/4/8 с, 403/429 → `BlockedError`, robots.txt с кешем 24 ч, проверка адреса после редиректа), `fetch_page`, `fetch_detail` (страница объявления), `build_page_url`, `check_url_allowed` |
-| `jobbot/parser.py` | `parse_listing` (основной), `parse_listing_fallback` (запасной), `parse_page` → `ParseResult(ads, simplified)` |
-| `jobbot/matcher.py` | `normalize()`, `contains_word()`, `matches(text, mode, include, exclude)`, `validate_keyword()` (+ лимиты слов) |
+| `jobbot/parser.py` | `parse_listing` (основной), `parse_listing_fallback` (запасной), `parse_page` → `ParseResult(ads, simplified)`; v1.1: `parse_salary` (+ `SALARY_BADGES`), `parse_detail` (+ `DETAIL_LABELS`) |
+| `jobbot/matcher.py` | `normalize()` (= `normalize_text` без удаления скобок), `contains_word()`, `matches(text, mode, include, exclude)`, `validate_keyword()` (+ лимиты слов) |
 | `jobbot/storage.py` | `Storage` (aiosqlite, WAL, миграции `MIGRATIONS` = функции v1, v2; копия базы `backup_database` перед миграцией): объявления, ключевые слова, разделы, `seed_defaults`, `state`, профиль фильтров (`get_filter_profile`, `update_profile`) |
 | `jobbot/notifier.py` | `format_card`, `card_keyboard`, `format_seed_header`, `format_digest`, `Notifier` (`send_text`, `send_ads` → список доставленных `ad_id`; пауза ≥1 с, повтор на `TelegramRetryAfter`) |
 | `jobbot/poller.py` | `Poller`: `poll_once()` (под `asyncio.Lock`, None если уже идёт), `run_forever(stop)`, `next_delay()`, `flush_unsent(since)`; seed, многостраничность, пауза, пауза 30 мин после 403/429, самодиагностика и служебные уведомления (`_alert`) |
@@ -106,6 +107,7 @@
 | `tests/test_main.py` | `_serve`: опрос и приём команд работают вместе, останавливаются по `stop` |
 | `tests/test_migration.py` | Миграция v1 → v2 на копии базы v1 с данными, бэкап, идемпотентность, профиль в базе |
 | `tests/test_filters.py` | Каталог, настройки v1.1, модель `FilterProfile` |
+| `tests/test_parsing_v2.py` | Нормализация, `parse_salary`, город карточки, `parse_detail` |
 | `tests/test_poller.py` | Тесты poller: seed, дубли, новые, фильтры, страницы, пауза, сбои отправки, ошибки, блокировка, lock, самодиагностика и уведомления |
 | `tests/test_fetcher.py` | Тесты fetcher через respx: задержка, повторы, 403/429, robots |
 
@@ -221,6 +223,10 @@ docker compose restart
 - 2026-10-05 · Fetcher: после редиректа итоговый URL проверяется `check_url_allowed` (только somon.tj, без запрещённых путей и параметров), иначе `FetchError` · `follow_redirects=True` из ТЗ сохранён.
 - 2026-10-05 · `pyproject.toml`: `pythonpath = ["."]` — без этого голый `pytest` на Linux (CI) не видел пакет `jobbot` (локально работал `python -m pytest`).
 - 2026-10-05 · Railway: `RAILWAY_RUN_UID=0` (иначе пользователь uid 1000 не может писать в том Railway; в CI и docker-compose контейнер остаётся не-root). Том `/app/data` создан через CLI.
+- 2026-10-06 · Одна нормализация на всё (`normalize_text`): ключевые слова и заголовки тоже получили таджикские буквы и схлопывание дефисов, но для заголовков текст в скобках НЕ удаляется (`drop_brackets=False`) — иначе «Курьер (Python)» потерял бы слово python. Старые слова в базе совместимы (в них нет таджикских букв/двойных дефисов).
+- 2026-10-06 · `parse_salary`/`parse_detail` — в `parser.py` (там же весь разбор HTML); `Salary`/`AdDetails` — в `models.py`. Зарплата: одиночная цена → min=max; «от A до B» и перепутанные края диапазона упорядочиваются; валюта необязательна (`c`, `с`, `сом`, `сомони`, `tjs`, `смн`). Значки VIP/ТОП/TOP/Срочно/Премиум снимаются в начале строки, в том числе склеенные и несколько подряд.
+- 2026-10-06 · `parse_detail`: метки сравниваются после нормализации без двоеточия; пары берутся из `dt`/`dd` блока `AdvertFeaturesApp`, а если его нет — из любых `dt`/`dd` страницы (переживёт смену обёртки); город — из блока `AdvertLocationApp`, если в парах его нет. Значения хранятся как на сайте (для показа), нормализуются при сравнении.
+- 2026-10-06 · `Storage.add_ads` сразу пишет разобранные `salary_min/max/negotiable` и `city_norm`; миграция v2 заполняет их для старых объявлений (сделано до релиза миграции).
 - 2026-10-06 · Разделы для опроса теперь строятся из каталога по `VISIBLE_CATEGORIES` (`settings.categories` — свойство, а не поле); `DEFAULT_CATEGORIES` = it, students с теми же URL, что в v1.0 — поведение по умолчанию не изменилось. Старый способ «добавить строку в DEFAULT_CATEGORIES» больше не работает — README обновлён.
 - 2026-10-06 · Миграции — список async-функций (v1 = прежний SQL, v2 = новые столбцы/таблицы + перенос). `ALTER TABLE ADD COLUMN` выполняется только для отсутствующих столбцов (`PRAGMA table_info`) — миграция переживает частично применённое состояние. Перенос: включённые разделы из `categories` (только ключи каталога) → `FilterProfile.categories`; если ни одного — профиль по умолчанию. `INSERT OR IGNORE` — существующий профиль не перезаписывается.
 - 2026-10-06 · Копия перед миграцией: только если в базе уже есть схема (версия ≥1) и она старше кода; `<папка базы>/backups/<имя>-YYYYMMDDTHHMMSSZ.db` через `sqlite3.backup` (целостно в WAL). Свежая база копию не делает. На Railway копия ляжет на том `/app/data/backups/`.
@@ -236,7 +242,7 @@ docker compose restart
 
 > Формат: `- [ ] описание · где · приоритет (высокий/средний/низкий)`
 
-- [ ] `city_norm` для объявлений, сохранённых до v1.1, пуст — заполнить в `_migration_v2`, когда появится `normalize.py` (9.3) · 9.3 · низкий
+- [x] `city_norm` и зарплата для объявлений, сохранённых до v1.1, заполняются миграцией v2 (сделано на 9.3)
 - [ ] Стаж «Любой» — значение сайта, совпадает по тексту с кнопкой «Любой» (= фильтр выкл.) из ТЗ 7.3; на 9.6 подписать по-разному · 9.6 · средний
 - [ ] ТЗ 9.9 описывает деплой через `docker compose` на сервере, а прод — Railway (том `/app/data`, `railway up`); бэкап базы перед миграцией делать через `railway ssh`/том — уточнить на 9.9 · 9.9 · средний
 
@@ -263,6 +269,12 @@ docker compose restart
 > - Файлы: …
 > - Проверка: команда → ожидаемый результат
 > - Заметки: …
+
+### 2026-10-06 · v1.1 · 9.3 Парсинг v2
+- Сделано: `normalize.py` (таджикские буквы, скобки, синонимы городов), `parse_salary` (значки, «от/до», диапазоны, «Договорная», нераспознанное → WARNING), `Ad.city_norm`, `parse_detail` (график, стаж, город, сфера, компания), `Salary`/`AdDetails`; `matcher.normalize` переведён на общую нормализацию; `add_ads` и миграция v2 заполняют `salary_*` и `city_norm`.
+- Файлы: `jobbot/normalize.py`, `jobbot/models.py`, `jobbot/parser.py`, `jobbot/matcher.py`, `jobbot/storage.py`, `tests/test_parsing_v2.py`, `tests/test_migration.py`.
+- Проверка: `pytest` → 303 passed (было 240); `ruff check .`/`ruff format --check .` → чисто. Все 115 зарплат с реальных страниц-фикстур распознаются без предупреждений.
+- Заметки: в тестах неразрывные пробелы записаны как `\u00a0`/`\u202f`, чтобы их было видно.
 
 ### 2026-10-06 · v1.1 · 9.2 Каталог, модель, миграция v2
 - Сделано: `catalog.py` (26 разделов), `filters.py` (`SalaryFilter`, `FilterProfile`, `load_profile`/`dump_profile`), настройки `VISIBLE_CATEGORIES`/`MAX_DETAILS_PER_CYCLE` (+ `.env.example`, README), миграция базы до версии 2 с автоматической копией, `Storage.get_filter_profile`/`update_profile`.
