@@ -20,12 +20,26 @@ from datetime import UTC, datetime, timedelta
 from aiogram.exceptions import TelegramAPIError
 
 from jobbot.config import MIN_POLL_INTERVAL_SEC, Category, Settings
-from jobbot.fetcher import BlockedError, Fetcher, FetchError, RobotsDisallowedError
-from jobbot.matcher import matches
+from jobbot.fetcher import (
+    BlockedError,
+    Fetcher,
+    FetchError,
+    HttpStatusError,
+    RobotsDisallowedError,
+)
+from jobbot.filters import FilterProfile
+from jobbot.matcher import Mode
 from jobbot.models import Ad
 from jobbot.notifier import Notifier, format_seed_header
-from jobbot.parser import parse_page
-from jobbot.storage import CategoryState, Storage, from_iso, to_iso
+from jobbot.parser import parse_detail, parse_page
+from jobbot.selection import (
+    CardFacts,
+    Decision,
+    check_card,
+    check_details,
+    initial_details_status,
+)
+from jobbot.storage import Storage, from_iso, to_iso
 
 log = logging.getLogger("poller")
 
@@ -63,6 +77,7 @@ class CategoryStats:
 class CycleStats:
     categories: list[CategoryStats] = field(default_factory=list)
     skipped: str | None = None  # причина, если цикл не выполнялся (пауза после 403/429)
+    details_loaded: int = 0  # v1.1: сколько страниц объявлений загружено за цикл
 
 
 class Poller:
@@ -144,22 +159,33 @@ class Poller:
 
         include = await self._storage.get_keywords("include")
         exclude = await self._storage.get_keywords("exclude")
-        states = {s.key: s for s in await self._storage.get_categories()}
+        profile = await self._storage.get_filter_profile()
+        # Режим ключевых слов (all/keywords) — по-прежнему из /categories.
+        modes = {s.key: s.mode for s in await self._storage.get_categories()}
         simplified_ids: set[int] = set()  # найдены запасным парсером → пометка в сообщении
+        # Опрашиваем только разделы, которые и видимы (VISIBLE_CATEGORIES), и выбраны в фильтре.
+        selected = [c for c in self._settings.categories if c.key in profile.categories]
+        if not selected:
+            log.warning("ни один выбранный в фильтре раздел не входит в VISIBLE_CATEGORIES")
+        blocked = False
 
-        for category in self._settings.categories:
-            state = states.get(category.key)
-            if state is None or not state.enabled:
-                continue
+        for category in selected:
             cat_stats = CategoryStats(category.key)
             stats.categories.append(cat_stats)
             try:
                 await self._poll_category(
-                    category, state, include, exclude, cat_stats, simplified_ids
+                    category,
+                    profile,
+                    modes.get(category.key, "all"),
+                    include,
+                    exclude,
+                    cat_stats,
+                    simplified_ids,
                 )
             except BlockedError as exc:
                 cat_stats.error = str(exc)
                 await self._enter_block_pause(exc)
+                blocked = True
                 break  # остальные разделы не трогаем
             except RobotsDisallowedError as exc:
                 cat_stats.error = str(exc)
@@ -181,8 +207,16 @@ class Poller:
                 log.exception("%s: ошибка при обработке раздела", category.key)
                 await self._record_error(f"{category.key}: {exc!r}")
 
+        if not blocked:
+            try:
+                await self._process_details(profile, stats)
+            except Exception:
+                log.exception("ошибка в очереди страниц объявлений")
+
         await self._send_pending(stats=stats, simplified_ids=simplified_ids)
         await self._storage.set_state(STATE_LAST_POLL, to_iso(self._now()))
+        if stats.details_loaded:
+            log.info("страниц объявлений загружено: %d", stats.details_loaded)
         for cat_stats in stats.categories:
             log.info(
                 "%s: найдено %d, новых %d, отправлено %d",
@@ -196,7 +230,8 @@ class Poller:
     async def _poll_category(
         self,
         category: Category,
-        state: CategoryState,
+        profile: FilterProfile,
+        keyword_mode: Mode,
         include: list[str],
         exclude: list[str],
         stats: CategoryStats,
@@ -216,15 +251,30 @@ class Poller:
                 break
             stats.found += len(result.ads)
 
-            items = [
-                (ad, matches(ad.title, mode=state.mode, include=include, exclude=exclude))
+            # Ступень 1 отбора — по карточке, без запросов к сайту.
+            decisions = {
+                ad.ad_id: check_card(
+                    CardFacts.from_ad(ad),
+                    profile,
+                    keyword_mode=keyword_mode,
+                    include=include,
+                    exclude=exclude,
+                )
                 for ad in result.ads
-            ]
-            matched_ids = {ad.ad_id for ad, ok in items if ok}
-            new = await self._storage.add_ads(items, skip_sending=seeding, now=self._now())
+            }
+            items = [(ad, decisions[ad.ad_id] is Decision.ACCEPT) for ad in result.ads]
+            # При первом запуске страницы объявлений не грузим: это «тихое» запоминание.
+            statuses = {
+                ad_id: "skipped" if seeding else initial_details_status(decision)
+                for ad_id, decision in decisions.items()
+            }
+            new = await self._storage.add_ads(
+                items, skip_sending=seeding, details_status=statuses, now=self._now()
+            )
             stats.new += len(new)
+            await self._storage.record_attr_values("city", [ad.city for ad in new], now=self._now())
             for ad in new:
-                if ad.ad_id not in matched_ids:
+                if decisions[ad.ad_id] is Decision.REJECT:
                     continue
                 if seeding:
                     seed_pool.append(ad)
@@ -237,6 +287,59 @@ class Poller:
 
         if seeding and seed_pool:
             await self._send_seed(category, seed_pool, stats)
+
+    async def _process_details(self, profile: FilterProfile, stats: CycleStats) -> None:
+        """Ступень 2: страницы объявлений из очереди (новые первыми, не больше лимита за цикл).
+
+        Ошибка загрузки → ещё одна попытка в следующем цикле; после 3 неудач объявление
+        отправляется с пометкой «график/стаж не проверены». Удалённое объявление (404/410)
+        не отправляется.
+        """
+        now = self._now()
+        await self._storage.expire_pending_details(now - UNSENT_WINDOW)
+        if not profile.needs_details:
+            accepted = await self._storage.accept_pending_without_details()
+            if accepted:
+                log.info("график/стаж сняты с фильтра: %d объявлений из очереди подходят", accepted)
+            return
+
+        queue = await self._storage.pending_details(
+            now - UNSENT_WINDOW, self._settings.max_details_per_cycle
+        )
+        for item in queue:
+            ad = item.ad
+            try:
+                page_html = await self._fetcher.fetch_detail(ad.url)
+            except BlockedError as exc:
+                await self._enter_block_pause(exc)
+                return
+            except HttpStatusError as exc:
+                if exc.status_code in (404, 410):
+                    log.info("объявление %d удалено с сайта — не отправляем", ad.ad_id)
+                    await self._storage.drop_pending_detail(ad.ad_id)
+                else:
+                    attempts = await self._storage.detail_failed(ad.ad_id)
+                    log.warning("страница %d: %s (попытка %d)", ad.ad_id, exc, attempts)
+                continue
+            except (RobotsDisallowedError, ValueError) as exc:
+                # Адрес нельзя запрашивать (robots.txt, `---` в ссылке) — повторять бесполезно.
+                log.warning("страница %d недоступна для бота: %s", ad.ad_id, exc)
+                await self._storage.detail_failed(ad.ad_id, permanent=True)
+                continue
+            except FetchError as exc:
+                await self._note_fetch_failed(exc)
+                attempts = await self._storage.detail_failed(ad.ad_id)
+                log.warning("страница %d не загрузилась: %s (попытка %d)", ad.ad_id, exc, attempts)
+                continue
+
+            await self._note_fetch_ok()
+            details = parse_detail(page_html)
+            await self._storage.record_attr_values("schedule", [details.schedule], now=now)
+            await self._storage.record_attr_values("experience", [details.experience], now=now)
+            await self._storage.save_details(
+                ad.ad_id, details, matched=check_details(details, profile)
+            )
+            stats.details_loaded += 1
 
     async def _send_seed(self, category: Category, pool: list[Ad], stats: CategoryStats) -> None:
         """Первый запуск: показать владельцу только последние SEED_SEND_LAST вакансий раздела."""

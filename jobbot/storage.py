@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -23,7 +23,7 @@ from jobbot.catalog import CATALOG_BY_KEY
 from jobbot.config import Category
 from jobbot.filters import FilterProfile, dump_profile, load_profile
 from jobbot.matcher import normalize
-from jobbot.models import Ad
+from jobbot.models import Ad, AdDetails
 from jobbot.normalize import normalize_city, normalize_text
 from jobbot.parser import parse_salary
 
@@ -187,6 +187,17 @@ def to_iso(moment: datetime | None = None) -> str:
     return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+MAX_DETAIL_ATTEMPTS = 3  # после стольких неудач страница объявления считается непроверенной
+
+
+@dataclass(frozen=True, slots=True)
+class PendingDetail:
+    """Объявление в очереди на загрузку страницы (график/стаж)."""
+
+    ad: Ad
+    attempts: int
+
+
 def _row_to_ad(row: aiosqlite.Row) -> Ad:
     return Ad(
         ad_id=row["ad_id"],
@@ -196,6 +207,11 @@ def _row_to_ad(row: aiosqlite.Row) -> Ad:
         salary_text=row["salary_text"],
         city=row["city"],
         date_label=row["date_label"],
+        schedule=row["schedule"],
+        experience=row["experience"],
+        company=row["company"],
+        sphere=row["sphere"],
+        details_status=row["details_status"],
     )
 
 
@@ -359,6 +375,7 @@ class Storage:
         items: Iterable[tuple[Ad, bool]],
         *,
         skip_sending: bool = False,
+        details_status: Mapping[int, str] | None = None,
         now: datetime | None = None,
     ) -> list[Ad]:
         """Сохранить объявления (`INSERT OR IGNORE`) и вернуть только действительно новые.
@@ -367,6 +384,8 @@ class Storage:
         в результат не попадает. `skip_sending=True` — объявления первого запуска: они
         запоминаются как обработанные (`sent_at = SKIPPED_SENT_AT`) и никогда не отправляются,
         но и не считаются «отправленными сегодня» в /status.
+        `details_status` — статус очереди страниц по `ad_id` (`pending`/`skipped`, по умолчанию
+        `skipped`).
         """
         stamp = to_iso(now)
         sent_at = SKIPPED_SENT_AT if skip_sending else None
@@ -377,8 +396,8 @@ class Storage:
                 cursor = await db.execute(
                     "INSERT OR IGNORE INTO ads (ad_id, category_key, title, url, salary_text, "
                     "city, date_label, matched, first_seen_at, sent_at, "
-                    "salary_min, salary_max, salary_negotiable, city_norm) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "salary_min, salary_max, salary_negotiable, city_norm, details_status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         ad.ad_id,
                         ad.category_key,
@@ -394,6 +413,7 @@ class Storage:
                         salary.max,
                         int(salary.negotiable),
                         ad.city_norm,
+                        (details_status or {}).get(ad.ad_id, "skipped"),
                     ),
                 )
                 if cursor.rowcount == 1:
@@ -409,10 +429,90 @@ class Storage:
                 [(stamp, ad_id) for ad_id in ad_ids],
             )
 
+    # ---------- очередь страниц объявлений (v1.1) ----------
+
+    async def pending_details(self, since: datetime, limit: int) -> list[PendingDetail]:
+        """Объявления, ждущие загрузки страницы: новые первыми, не старше `since`."""
+        rows = await self._fetchall(
+            "SELECT ad_id, category_key, title, url, salary_text, city, date_label, schedule, "
+            "experience, company, sphere, details_status, details_attempts FROM ads "
+            "WHERE details_status = 'pending' AND first_seen_at >= ? "
+            "ORDER BY first_seen_at DESC, ad_id DESC LIMIT ?",
+            (to_iso(since), limit),
+        )
+        return [PendingDetail(_row_to_ad(r), r["details_attempts"]) for r in rows]
+
+    async def expire_pending_details(self, before: datetime) -> int:
+        """Старые объявления из очереди больше не проверяем (их уже не отправить)."""
+        async with self._tx() as db:
+            cursor = await db.execute(
+                "UPDATE ads SET details_status = 'skipped' "
+                "WHERE details_status = 'pending' AND first_seen_at < ?",
+                (to_iso(before),),
+            )
+            return cursor.rowcount
+
+    async def accept_pending_without_details(self) -> int:
+        """График/стаж сняли с фильтра — ожидающие объявления прошли карточку и подходят."""
+        async with self._tx() as db:
+            cursor = await db.execute(
+                "UPDATE ads SET details_status = 'skipped', matched = 1 "
+                "WHERE details_status = 'pending'"
+            )
+            return cursor.rowcount
+
+    async def save_details(self, ad_id: int, details: AdDetails, *, matched: bool) -> None:
+        """Страница загружена: сохранить поля и решение по графику/стажу."""
+        async with self._tx() as db:
+            await db.execute(
+                "UPDATE ads SET schedule = ?, experience = ?, company = ?, sphere = ?, "
+                "city_norm = COALESCE(city_norm, ?), details_status = 'ok', matched = ? "
+                "WHERE ad_id = ?",
+                (
+                    details.schedule,
+                    details.experience,
+                    details.company,
+                    details.sphere,
+                    normalize_city(details.city) if details.city else None,
+                    int(matched),
+                    ad_id,
+                ),
+            )
+
+    async def detail_failed(self, ad_id: int, *, permanent: bool = False) -> int:
+        """Страница не загрузилась: +1 попытка; на 3-й (или сразу при `permanent`) — `failed`.
+
+        `failed` → объявление подходит (`matched = 1`) и уйдёт с пометкой «не проверено»:
+        лучше лишнее уведомление, чем пропущенная вакансия. Возвращает число попыток.
+        """
+        async with self._tx() as db:
+            cursor = await db.execute("SELECT details_attempts FROM ads WHERE ad_id = ?", (ad_id,))
+            row = await cursor.fetchone()
+            attempts = (row[0] if row else 0) + 1
+            if permanent or attempts >= MAX_DETAIL_ATTEMPTS:
+                await db.execute(
+                    "UPDATE ads SET details_attempts = ?, details_status = 'failed', matched = 1 "
+                    "WHERE ad_id = ?",
+                    (attempts, ad_id),
+                )
+            else:
+                await db.execute(
+                    "UPDATE ads SET details_attempts = ? WHERE ad_id = ?", (attempts, ad_id)
+                )
+            return attempts
+
+    async def drop_pending_detail(self, ad_id: int) -> None:
+        """Объявление удалено с сайта (404): не проверяем и не отправляем."""
+        async with self._tx() as db:
+            await db.execute(
+                "UPDATE ads SET details_status = 'failed', matched = 0 WHERE ad_id = ?", (ad_id,)
+            )
+
     async def unsent_matched(self, since: datetime) -> list[Ad]:
         """Подходящие, но не отправленные объявления, найденные не раньше `since`."""
         rows = await self._fetchall(
-            "SELECT ad_id, category_key, title, url, salary_text, city, date_label FROM ads "
+            "SELECT ad_id, category_key, title, url, salary_text, city, date_label, schedule, "
+            "experience, company, sphere, details_status FROM ads "
             "WHERE matched = 1 AND sent_at IS NULL AND first_seen_at >= ? "
             "ORDER BY first_seen_at, ad_id",
             (to_iso(since),),
@@ -422,7 +522,8 @@ class Storage:
     async def recent_matched(self, limit: int, category_key: str | None = None) -> list[Ad]:
         """Последние подходящие объявления (новые первыми), опционально по разделу."""
         rows = await self._fetchall(
-            "SELECT ad_id, category_key, title, url, salary_text, city, date_label FROM ads "
+            "SELECT ad_id, category_key, title, url, salary_text, city, date_label, schedule, "
+            "experience, company, sphere, details_status FROM ads "
             "WHERE matched = 1 AND (? IS NULL OR category_key = ?) "
             "ORDER BY first_seen_at DESC, ad_id DESC LIMIT ?",
             (category_key, category_key, limit),
@@ -473,11 +574,31 @@ class Storage:
     # ---------- разделы ----------
 
     async def get_categories(self) -> list[CategoryState]:
+        """Разделы из `/categories`. С v1.1 «включён» = выбран в профиле фильтров."""
         rows = await self._fetchall("SELECT key, enabled, mode FROM categories ORDER BY rowid")
-        return [CategoryState(r["key"], bool(r["enabled"]), r["mode"]) for r in rows]
+        selected = set((await self.get_filter_profile()).categories)
+        return [CategoryState(r["key"], r["key"] in selected, r["mode"]) for r in rows]
 
     async def set_category_enabled(self, key: str, enabled: bool) -> None:
+        """Включить/выключить раздел: меняет профиль фильтров (источник правды) и старый флаг.
+
+        Выключить последний выбранный раздел нельзя — ValueError, ничего не меняется.
+        """
         async with self._tx() as db:
+            cursor = await db.execute("SELECT data FROM filter_profile WHERE id = 1")
+            row = await cursor.fetchone()
+            profile = load_profile(row["data"] if row else None)
+            keys = [k for k in profile.categories if k != key]
+            if enabled:
+                keys.append(key)
+            if not keys:
+                raise ValueError("Нужна хотя бы одна категория")
+            updated = FilterProfile.model_validate({**profile.model_dump(), "categories": keys})
+            await db.execute(
+                "INSERT INTO filter_profile (id, data) VALUES (1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                (dump_profile(updated),),
+            )
             await db.execute("UPDATE categories SET enabled = ? WHERE key = ?", (int(enabled), key))
 
     async def set_category_mode(self, key: str, mode: Literal["all", "keywords"]) -> None:

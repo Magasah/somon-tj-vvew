@@ -18,6 +18,17 @@ class Ad:
     salary_text: str | None = None
     city: str | None = None
     date_label: str | None = None
+    # v1.1: со страницы объявления (заполняются после загрузки деталей, иначе None)
+    schedule: str | None = None
+    experience: str | None = None
+    company: str | None = None
+    sphere: str | None = None
+    details_status: str | None = None  # none|pending|ok|failed|skipped
+
+    @property
+    def details_unchecked(self) -> bool:
+        """График/стаж нужно было проверить, но страница объявления не загрузилась."""
+        return self.details_status == "failed"
 
     @property
     def city_norm(self) -> str | None:

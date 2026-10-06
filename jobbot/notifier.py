@@ -25,6 +25,7 @@ log = logging.getLogger("notifier")
 AD_URL_PREFIX = f"{BASE_URL}/adv/"
 BUTTON_TEXT = "Открыть на Somon"
 SIMPLIFIED_MARK = "⚠️ (упрощённый режим)"
+UNCHECKED_MARK = "⚠️ график/стаж не проверены"
 
 # Лимит Telegram — 4096 символов на сообщение; берём с запасом.
 MAX_MESSAGE_LEN = 4000
@@ -54,6 +55,8 @@ def format_card(ad: Ad, category_title: str, *, simplified: bool = False) -> str
     if details:
         lines.append(" · ".join(details))
     lines.append(f"🏷 {_esc(category_title)}")
+    if ad.details_unchecked:
+        lines.append(UNCHECKED_MARK)
     if simplified:
         lines.append(SIMPLIFIED_MARK)
     return "\n".join(lines)

@@ -300,7 +300,11 @@ def create_router(deps: BotDeps) -> Router:
         action, key = parts[1], parts[2]
         current = states[key]
         if action == "t":
-            await storage.set_category_enabled(key, not current.enabled)
+            try:
+                await storage.set_category_enabled(key, not current.enabled)
+            except ValueError as exc:  # последний выбранный раздел выключить нельзя
+                await query.answer(str(exc), show_alert=True)
+                return
         elif action == "m":
             await storage.set_category_mode(key, "keywords" if current.mode == "all" else "all")
         else:
