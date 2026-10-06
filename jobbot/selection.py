@@ -111,6 +111,40 @@ def check_details(details: AdDetails, profile: FilterProfile) -> bool:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class StoredAd:
+    """Объявление из базы вместе с разобранными полями карточки (для подсчётов в меню)."""
+
+    ad: Ad
+    facts: CardFacts
+
+
+def matches_profile(
+    item: StoredAd,
+    profile: FilterProfile,
+    *,
+    keyword_mode: Mode,
+    include: Iterable[str],
+    exclude: Iterable[str],
+) -> bool:
+    """Подходит ли уже сохранённое объявление под текущий профиль.
+
+    Если нужен график/стаж, а страница объявления не загружалась (или не загрузилась) —
+    решает `include_unknown_attrs`.
+    """
+    decision = check_card(
+        item.facts, profile, keyword_mode=keyword_mode, include=include, exclude=exclude
+    )
+    if decision is Decision.REJECT:
+        return False
+    if decision is Decision.ACCEPT:
+        return True
+    if item.ad.details_status == "ok":
+        details = AdDetails(schedule=item.ad.schedule, experience=item.ad.experience)
+        return check_details(details, profile)
+    return profile.include_unknown_attrs
+
+
 def initial_details_status(decision: Decision) -> str:
     """`details_status` для нового объявления: `pending` — в очередь страниц, иначе `skipped`."""
     return "pending" if decision is Decision.NEED_DETAILS else "skipped"

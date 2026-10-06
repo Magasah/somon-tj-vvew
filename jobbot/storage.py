@@ -23,9 +23,10 @@ from jobbot.catalog import CATALOG_BY_KEY
 from jobbot.config import Category
 from jobbot.filters import FilterProfile, dump_profile, load_profile
 from jobbot.matcher import normalize
-from jobbot.models import Ad, AdDetails
+from jobbot.models import Ad, AdDetails, Salary
 from jobbot.normalize import normalize_city, normalize_text
 from jobbot.parser import parse_salary
+from jobbot.selection import CardFacts, StoredAd
 
 log = logging.getLogger("storage")
 
@@ -508,6 +509,23 @@ class Storage:
                 "UPDATE ads SET details_status = 'failed', matched = 0 WHERE ad_id = ?", (ad_id,)
             )
 
+    async def ads_since(self, since: datetime) -> list[StoredAd]:
+        """Все объявления, найденные не раньше `since` (новые первыми), с разобранной карточкой."""
+        rows = await self._fetchall(
+            "SELECT ad_id, category_key, title, url, salary_text, city, date_label, schedule, "
+            "experience, company, sphere, details_status, salary_min, salary_max, "
+            "salary_negotiable, city_norm FROM ads WHERE first_seen_at >= ? "
+            "ORDER BY first_seen_at DESC, ad_id DESC",
+            (to_iso(since),),
+        )
+        result = []
+        for row in rows:
+            ad = _row_to_ad(row)
+            salary = Salary(row["salary_min"], row["salary_max"], bool(row["salary_negotiable"]))
+            facts = CardFacts(ad.category_key, ad.title, row["city_norm"], salary)
+            result.append(StoredAd(ad, facts))
+        return result
+
     async def unsent_matched(self, since: datetime) -> list[Ad]:
         """Подходящие, но не отправленные объявления, найденные не раньше `since`."""
         rows = await self._fetchall(
@@ -566,6 +584,14 @@ class Storage:
         async with self._tx() as db:
             cursor = await db.execute("DELETE FROM keywords WHERE word = ?", (normalize(word),))
             return cursor.rowcount
+
+    async def remove_keyword_from(self, kind: KeywordKind, word: str) -> bool:
+        """Удалить слово только из одного списка (кнопка в меню). False — слова не было."""
+        async with self._tx() as db:
+            cursor = await db.execute(
+                "DELETE FROM keywords WHERE kind = ? AND word = ?", (kind, normalize(word))
+            )
+            return cursor.rowcount == 1
 
     async def count_keywords(self, kind: KeywordKind) -> int:
         row = await self._fetchone("SELECT COUNT(*) FROM keywords WHERE kind = ?", (kind,))

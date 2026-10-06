@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -110,3 +111,37 @@ def load_profile(raw: str | None) -> FilterProfile:
 
 def dump_profile(profile: FilterProfile) -> str:
     return profile.model_dump_json()
+
+
+SALARY_INPUT_HELP = "Примеры: 2000, от 2000, до 5000, 2000-5000"
+
+
+def parse_salary_input(text: str) -> tuple[int | None, int | None]:
+    """Ручной ввод зарплаты в меню → (от, до). Неверный ввод → ValueError с подсказкой.
+
+    `2000` и `от 2000` → (2000, None); `до 5000` → (None, 5000); `2000-5000` → (2000, 5000).
+    Пробелы внутри чисел допускаются: `2 000`.
+    """
+    value = " ".join(text.lower().replace("–", "-").replace("—", "-").split())
+    value = re.sub(r"(?<=\d) (?=\d{3}\b)", "", value)  # «2 000» → «2000»
+    value = re.sub(r"\s*(c|с|сом|сомони)\.?$", "", value)
+    patterns = (
+        (r"(\d+)", lambda m: (int(m[1]), None)),
+        (r"от ?(\d+)", lambda m: (int(m[1]), None)),
+        (r"до ?(\d+)", lambda m: (None, int(m[1]))),
+        (r"(\d+) ?- ?(\d+)", lambda m: (int(m[1]), int(m[2]))),
+        (r"от ?(\d+) ?до ?(\d+)", lambda m: (int(m[1]), int(m[2]))),
+    )
+    for pattern, build in patterns:
+        match = re.fullmatch(pattern, value)
+        if match:
+            low, high = build(match)
+            break
+    else:
+        raise ValueError(f"Не понял формат. {SALARY_INPUT_HELP}")
+    for amount in (low, high):
+        if amount is not None and amount > MAX_SALARY:
+            raise ValueError(f"Слишком большая сумма: максимум {MAX_SALARY:,}".replace(",", " "))
+    if low is not None and high is not None and low > high:
+        raise ValueError(f"«От» больше, чем «до». {SALARY_INPUT_HELP}")
+    return low, high

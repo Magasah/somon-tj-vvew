@@ -224,10 +224,11 @@ async def test_user_text_is_escaped_in_replies(h: Harness) -> None:
 
 
 async def test_filters_view(h: Harness) -> None:
+    # v1.1: /filters открывает меню фильтров (подробные тесты — tests/test_filters_menu.py)
     await h.say("/filters")
     text = h.replies[0]
-    assert "python" in text and "колл-центр" in text
-    assert "IT, телеком, компьютеры" in text and "режим all" in text
+    assert "Ваши фильтры" in text and "колл-центр" in text
+    assert "IT, телеком, компьютеры" in text and "Подходит за последние 7 дней" in text
 
 
 # ---------- разделы ----------

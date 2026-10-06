@@ -178,6 +178,12 @@ class Notifier:
             return await self._send_digest(ads, simplified, header)
         return await self._send_cards(ads, category_titles, simplified, header)
 
+    async def send_digest(self, ads: Sequence[Ad]) -> list[int]:
+        """Отправить объявления одним списком (дайджестом) независимо от их числа."""
+        if not ads:
+            return []
+        return await self._send_digest(ads, False, None)
+
     async def _send_digest(
         self, ads: Sequence[Ad], simplified: bool, header: str | None
     ) -> list[int]:
