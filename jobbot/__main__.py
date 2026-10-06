@@ -14,11 +14,13 @@ from aiogram.exceptions import TelegramAPIError, TelegramUnauthorizedError
 from jobbot.bot.handlers import BotDeps, build_dispatcher
 from jobbot.config import DEFAULT_EXCLUDE, DEFAULT_INCLUDE, Settings, load_settings
 from jobbot.fetcher import Fetcher, FetchError
+from jobbot.filters import FilterProfile
 from jobbot.logging_setup import setup_logging
-from jobbot.notifier import Notifier
-from jobbot.parser import parse_page
+from jobbot.notifier import Notifier, salary_display
+from jobbot.parser import parse_detail, parse_page
 from jobbot.poller import Poller
-from jobbot.storage import Storage
+from jobbot.selection import CardFacts, Decision, check_card, check_details
+from jobbot.storage import FiltersSnapshot, Storage, read_filters_readonly
 
 log = logging.getLogger("main")
 
@@ -51,10 +53,24 @@ def _force_utf8_output() -> None:
 
 
 async def dry_run(settings: Settings) -> int:
-    """Один опрос первой страницы каждого раздела: печать в консоль, без базы и Telegram."""
+    """Один опрос первой страницы выбранных разделов: печать в консоль, без записи и Telegram.
+
+    Фильтры берутся из базы (только чтение), если она есть, иначе — по умолчанию. Если в
+    фильтре выбраны график или стаж, для первых `MAX_DETAILS_PER_CYCLE` подходящих по карточке
+    вакансий загружаются их страницы. Метки: ✅ подходит, ❌ нет, ⏳ нужна страница объявления.
+    """
+    snapshot = read_filters_readonly(settings.db_path)
+    if snapshot is None:
+        snapshot = FiltersSnapshot(
+            FilterProfile(), list(DEFAULT_INCLUDE), list(DEFAULT_EXCLUDE), {}
+        )
+        print("Базы нет — фильтры по умолчанию.")
+    profile = snapshot.profile
+    selected = [c for c in settings.categories if c.key in profile.categories]
+    details_left = settings.max_details_per_cycle if profile.needs_details else 0
     exit_code = 0
     async with Fetcher(settings.request_delay_sec) as fetcher:
-        for category in settings.categories:
+        for category in selected:
             try:
                 html = await fetcher.fetch_page(category.url)
             except FetchError as exc:
@@ -65,8 +81,35 @@ async def dry_run(settings: Settings) -> int:
             mode = " (упрощённый режим)" if result.simplified else ""
             print(f"\n=== {category.title}: найдено {len(result.ads)}{mode} ===")
             for ad in result.ads:
-                details = " · ".join(x for x in (ad.salary_text, ad.city, ad.date_label) if x)
-                print(f"[{ad.ad_id}] {ad.title}\n    {details}\n    {ad.url}")
+                decision = check_card(
+                    CardFacts.from_ad(ad),
+                    profile,
+                    keyword_mode=snapshot.modes.get(category.key, "all"),  # type: ignore[arg-type]
+                    include=snapshot.include,
+                    exclude=snapshot.exclude,
+                )
+                card = " · ".join(x for x in (salary_display(ad.salary_text), ad.city) if x)
+                extra = ""
+                if decision is Decision.NEED_DETAILS and details_left > 0:
+                    details_left -= 1
+                    try:
+                        details = parse_detail(await fetcher.fetch_detail(ad.url))
+                    except (FetchError, ValueError) as exc:
+                        extra = f"\n    страница не загрузилась: {exc}"
+                    else:
+                        attrs = " · ".join(
+                            x
+                            for x in (
+                                details.schedule and f"график: {details.schedule}",
+                                details.experience and f"стаж: {details.experience}",
+                            )
+                            if x
+                        )
+                        extra = f"\n    {attrs or 'график и стаж не указаны'}"
+                        ok = check_details(details, profile)
+                        decision = Decision.ACCEPT if ok else Decision.REJECT
+                marker = {"accept": "✅", "reject": "❌", "need_details": "⏳"}[decision.value]
+                print(f"{marker} [{ad.ad_id}] {ad.title}\n    {card}{extra}\n    {ad.url}")
     return exit_code
 
 

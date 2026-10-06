@@ -19,12 +19,15 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPrevie
 
 from jobbot.config import BASE_URL
 from jobbot.models import Ad
+from jobbot.normalize import normalize_text
+from jobbot.parser import parse_salary
 
 log = logging.getLogger("notifier")
 
 AD_URL_PREFIX = f"{BASE_URL}/adv/"
 BUTTON_TEXT = "Открыть на Somon"
 SIMPLIFIED_MARK = "⚠️ (упрощённый режим)"
+UNCHECKED_MARK = "⚠️ график/стаж не проверены"
 
 # Лимит Telegram — 4096 символов на сообщение; берём с запасом.
 MAX_MESSAGE_LEN = 4000
@@ -43,17 +46,60 @@ def is_safe_ad_url(url: str) -> bool:
     return url.startswith(AD_URL_PREFIX)
 
 
+def _money(amount: int) -> str:
+    return f"{amount:,}".replace(",", " ")
+
+
+def salary_display(text: str | None) -> str | None:
+    """Зарплата для карточки: `2 000–3 000 c.`, `от 3 000 c.`, `Договорная`.
+
+    Если формат не распознан — показываем текст с сайта как есть (без значков VIP/ТОП не
+    получится, но и вакансию не теряем).
+    """
+    salary = parse_salary(text)
+    if salary.negotiable:
+        return "Договорная"
+    if salary.min is not None and salary.max is not None:
+        if salary.min == salary.max:
+            return f"{_money(salary.min)} c."
+        return f"{_money(salary.min)}–{_money(salary.max)} c."
+    if salary.min is not None:
+        return f"от {_money(salary.min)} c."
+    if salary.max is not None:
+        return f"до {_money(salary.max)} c."
+    return " ".join(text.split()) if text and text.strip() else None
+
+
+def _experience_display(value: str | None) -> str | None:
+    if value and normalize_text(value) == "любой":
+        return "Любой стаж"  # так сайт пишет, когда опыт не важен
+    return value
+
+
+def _line(*parts: tuple[str, str | None]) -> str | None:
+    """Строка карточки из пар (значок, значение); пустые значения пропускаются."""
+    shown = [f"{icon} {_esc(value)}" for icon, value in parts if value and value.strip()]
+    return " · ".join(shown) or None
+
+
 def format_card(ad: Ad, category_title: str, *, simplified: bool = False) -> str:
-    """Текст карточки вакансии (HTML). Строки без данных пропускаются."""
+    """Карточка вакансии v1.1 (HTML). Пустые поля и строки не выводятся, всё экранируется.
+
+    💼 <b>Название</b>
+    💰 2 000–3 000 c. · 📍 Душанбе
+    🕒 Полный день · 🎓 Без опыта
+    🏢 Компания · 🗂 Раздел
+    """
     lines = [f"💼 <b>{_esc(ad.title)}</b>"]
-    details = [
-        f"{icon} {_esc(value)}"
-        for icon, value in (("💰", ad.salary_text), ("📍", ad.city), ("🕒", ad.date_label))
-        if value
-    ]
-    if details:
-        lines.append(" · ".join(details))
-    lines.append(f"🏷 {_esc(category_title)}")
+    for line in (
+        _line(("💰", salary_display(ad.salary_text)), ("📍", ad.city)),
+        _line(("🕒", ad.schedule), ("🎓", _experience_display(ad.experience))),
+        _line(("🏢", ad.company), ("🗂", category_title)),
+    ):
+        if line:
+            lines.append(line)
+    if ad.details_unchecked:
+        lines.append(UNCHECKED_MARK)
     if simplified:
         lines.append(SIMPLIFIED_MARK)
     return "\n".join(lines)
@@ -174,6 +220,12 @@ class Notifier:
         if len(ads) > self._threshold:
             return await self._send_digest(ads, simplified, header)
         return await self._send_cards(ads, category_titles, simplified, header)
+
+    async def send_digest(self, ads: Sequence[Ad]) -> list[int]:
+        """Отправить объявления одним списком (дайджестом) независимо от их числа."""
+        if not ads:
+            return []
+        return await self._send_digest(ads, False, None)
 
     async def _send_digest(
         self, ads: Sequence[Ad], simplified: bool, header: str | None

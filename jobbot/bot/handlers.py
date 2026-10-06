@@ -14,6 +14,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from jobbot.bot.filters_menu import create_filters_router, filters_reply_keyboard
 from jobbot.bot.middleware import OwnerOnlyMiddleware
 from jobbot.config import Settings
 from jobbot.matcher import MAX_WORDS_PER_LIST, validate_keyword
@@ -47,7 +48,7 @@ HELP_TEXT = (
     "/check — проверить сайт прямо сейчас\n"
     "/pause — приостановить уведомления\n"
     "/resume — возобновить уведомления\n"
-    "/filters — слова фильтра и режимы разделов\n"
+    "/filters — меню фильтров: категории, город, зарплата, график, стаж, слова\n"
     "/include <i>слово</i> — добавить слово в include\n"
     "/exclude <i>слово</i> — добавить слово в exclude\n"
     "/remove <i>слово</i> — удалить слово из обоих списков\n"
@@ -107,7 +108,7 @@ def create_router(deps: BotDeps) -> Router:
 
     @router.message(Command("start"))
     async def cmd_start(message: Message) -> None:
-        await reply(message, START_TEXT)
+        await reply(message, START_TEXT, reply_markup=filters_reply_keyboard())
 
     @router.message(Command("help"))
     async def cmd_help(message: Message) -> None:
@@ -199,21 +200,6 @@ def create_router(deps: BotDeps) -> Router:
 
     # ---------- фильтры ----------
 
-    @router.message(Command("filters"))
-    async def cmd_filters(message: Message) -> None:
-        include = await storage.get_keywords("include")
-        exclude = await storage.get_keywords("exclude")
-        lines = [
-            f"✅ <b>include</b> ({len(include)}): {esc(', '.join(include)) or '—'}",
-            f"🚫 <b>exclude</b> ({len(exclude)}): {esc(', '.join(exclude)) or '—'}",
-            "",
-            "<b>Разделы</b>",
-        ]
-        for cat in await storage.get_categories():
-            state = "вкл" if cat.enabled else "выкл"
-            lines.append(f"• {esc(titles.get(cat.key, cat.key))} — {state}, режим {cat.mode}")
-        await reply(message, "\n".join(lines))
-
     async def add_word(message: Message, command: CommandObject, kind: KeywordKind) -> None:
         name = "include" if kind == "include" else "exclude"
         if not command.args:
@@ -300,7 +286,11 @@ def create_router(deps: BotDeps) -> Router:
         action, key = parts[1], parts[2]
         current = states[key]
         if action == "t":
-            await storage.set_category_enabled(key, not current.enabled)
+            try:
+                await storage.set_category_enabled(key, not current.enabled)
+            except ValueError as exc:  # последний выбранный раздел выключить нельзя
+                await query.answer(str(exc), show_alert=True)
+                return
         elif action == "m":
             await storage.set_category_mode(key, "keywords" if current.mode == "all" else "all")
         else:
@@ -344,4 +334,5 @@ def build_dispatcher(deps: BotDeps) -> Dispatcher:
     dispatcher.message.outer_middleware(guard)
     dispatcher.callback_query.outer_middleware(guard)
     dispatcher.include_router(create_router(deps))
+    dispatcher.include_router(create_filters_router(deps))
     return dispatcher

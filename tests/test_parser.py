@@ -88,3 +88,30 @@ def test_foreign_and_broken_links_are_rejected() -> None:
 def test_long_title_is_truncated() -> None:
     html = f'<a href="/adv/7_x/">{"я" * 1000}</a>'
     assert len(parse_listing_fallback(html, "it")[0].title) == 300
+
+
+# ---------- v1.1, шаг 9.1: селекторы страницы объявления (реальные фикстуры) ----------
+
+DETAIL_EXPECTED = {
+    # фикстура: (цена, город, график, стаж)
+    "detail_salary_range.html": ("3 000 - 4 000 c.", "Душанбе", "Полный день", "Любой"),
+    "detail_no_experience.html": ("Договорная", "Душанбе", "Свободный график", "Без опыта"),
+    "detail_remote.html": ("900 c.", "Худжанд", "Удаленно", "Любой"),
+}
+
+
+@pytest.mark.parametrize(("fixture", "expected"), DETAIL_EXPECTED.items())
+def test_detail_page_selectors(fixture: str, expected: tuple[str, str, str, str]) -> None:
+    from selectolax.lexbor import LexborHTMLParser
+
+    tree = LexborHTMLParser(load(fixture))
+    pairs = {
+        row.css_first("dt").text(strip=True): " ".join(row.css_first("dd").text().split())
+        for row in tree.css('[data-component="AdvertFeaturesApp"] dl > div')
+    }
+    price = tree.css_first('[data-component="SidebarPrice"]').text(strip=True)
+    location = [s.text(strip=True) for s in tree.css('[data-component="AdvertLocationApp"] span')]
+
+    assert (price, location[1], pairs["График:"], pairs["Стаж:"]) == expected
+    assert location[0] == "Город:"
+    assert {"Сфера деятельности компании:", "Название, адрес компании:"} <= pairs.keys()

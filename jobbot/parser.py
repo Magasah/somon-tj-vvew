@@ -10,12 +10,14 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from itertools import pairwise
 from urllib.parse import urljoin, urlsplit
 
 from selectolax.lexbor import LexborHTMLParser, LexborNode
 
 from jobbot.config import BASE_URL
-from jobbot.models import Ad
+from jobbot.models import Ad, AdDetails, Salary
+from jobbot.normalize import normalize_text
 
 log = logging.getLogger("parser")
 
@@ -167,3 +169,104 @@ def parse_page(html: str, category_key: str) -> ParseResult:
     if fallback:
         log.warning("%s: основной парсер пуст, сработал запасной (%d)", category_key, len(fallback))
     return ParseResult(fallback, simplified=bool(fallback))
+
+
+# ---------- v1.1: зарплата ----------
+
+# Значки продвижения, которые на сайте бывают склеены с ценой («VIP900 c.», «ТОПДоговорная»).
+SALARY_BADGES: tuple[str, ...] = ("vip", "топ", "top", "срочно", "премиум", "premium")
+_BADGES_RE = re.compile(r"^(?:(?:" + "|".join(SALARY_BADGES) + r")[\s:·,-]*)+", re.IGNORECASE)
+_NUMBER = r"\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+"  # 2 000, 2\u00a0000, 2000
+_CURRENCY = r"(?:\s*(?:c|с|сом|сомони|tjs|смн)\.?)?"
+_RANGE_RE = re.compile(rf"^({_NUMBER})\s*[-–—]\s*({_NUMBER}){_CURRENCY}$")
+_FROM_RE = re.compile(rf"^от\s*({_NUMBER})(?:\s*до\s*({_NUMBER}))?{_CURRENCY}$")
+_TO_RE = re.compile(rf"^до\s*({_NUMBER}){_CURRENCY}$")
+_SINGLE_RE = re.compile(rf"^({_NUMBER}){_CURRENCY}$")
+
+
+def _to_int(number: str) -> int:
+    return int(re.sub(r"\D", "", number))
+
+
+def parse_salary(text: str | None) -> Salary:
+    """Текст зарплаты из карточки → Salary.
+
+    `900 c.` → 900–900; `1 500 - 3 000 c.` → 1500–3000; `от 3 000` → 3000–∞; `до 5 000` → ∞–5000;
+    `Договорная` → negotiable. Значки VIP/ТОП в начале отбрасываются. Нераспознанный текст →
+    пустая Salary и предупреждение в лог (без падения).
+    """
+    if not text or not text.strip():
+        return Salary()
+    value = " ".join(text.split())  # неразрывные пробелы тоже схлопываются
+    value = _BADGES_RE.sub("", value).strip().lower()
+    if value.startswith("договорн"):
+        return Salary(negotiable=True)
+    if match := _RANGE_RE.match(value):
+        low, high = sorted((_to_int(match.group(1)), _to_int(match.group(2))))
+        return Salary(min=low, max=high)
+    if match := _FROM_RE.match(value):
+        low = _to_int(match.group(1))
+        high = _to_int(match.group(2)) if match.group(2) else None
+        if high is not None and high < low:
+            low, high = high, low
+        return Salary(min=low, max=high)
+    if match := _TO_RE.match(value):
+        return Salary(max=_to_int(match.group(1)))
+    if match := _SINGLE_RE.match(value):
+        amount = _to_int(match.group(1))
+        return Salary(min=amount, max=amount)
+    log.warning("зарплата не распознана: %r", text[:MAX_FIELD_LEN])
+    return Salary()
+
+
+# ---------- v1.1: страница объявления ----------
+
+DETAIL_FEATURES = '[data-component="AdvertFeaturesApp"]'
+DETAIL_LOCATION = '[data-component="AdvertLocationApp"]'
+
+# Метка на сайте (после нормализации, без двоеточия) → поле AdDetails.
+DETAIL_LABELS: dict[str, str] = {
+    "график": "schedule",
+    "стаж": "experience",
+    "город": "city",
+    "сфера деятельности компании": "sphere",
+    "название, адрес компании": "company",
+}
+
+
+def _label_key(label: str) -> str | None:
+    return DETAIL_LABELS.get(normalize_text(label.rstrip(":  ")))
+
+
+def parse_detail(html: str) -> AdDetails:
+    """Страница объявления → AdDetails (график, стаж, город, сфера, компания).
+
+    Пары «метка: значение» берутся из `dt`/`dd` блока характеристик (а если его нет — из
+    любых `dt`/`dd` страницы) и из блока города. Незнакомые метки игнорируются, отсутствующие
+    поля — None. Значения — как на сайте (без нормализации), длина ограничена.
+    """
+    tree = LexborHTMLParser(html)
+    fields: dict[str, str] = {}
+
+    container = tree.css_first(DETAIL_FEATURES) or tree.body
+    rows = container.css("dt") if container is not None else []
+    for dt in rows:
+        dd = dt.next
+        while dd is not None and dd.tag != "dd":
+            dd = dd.next
+        key = _label_key(dt.text())
+        value = _clean(dd.text(separator=" ") if dd is not None else None, MAX_FIELD_LEN)
+        if key and value and key not in fields:
+            fields[key] = value
+
+    location = tree.css_first(DETAIL_LOCATION)
+    if location is not None:
+        spans = [span.text() for span in location.css("span")]
+        for label, value in pairwise(spans):
+            if _label_key(label) == "city" and "city" not in fields:
+                city = _clean(value, MAX_FIELD_LEN)
+                if city:
+                    fields["city"] = city
+                break
+
+    return AdDetails(**fields)

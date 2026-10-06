@@ -3,6 +3,7 @@
 import asyncio
 import sqlite3
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -138,7 +139,8 @@ async def test_recent_matched_order_limit_and_category(storage: Storage) -> None
 async def test_ad_roundtrip_keeps_fields(storage: Storage) -> None:
     ad = Ad(5, "https://somon.tj/adv/5_x/", "T", "it", None, None, None)
     await storage.add_ads([(ad, True)])
-    assert (await storage.recent_matched(1))[0] == ad
+    # статус очереди страниц по умолчанию — «не нужна» (v1.1)
+    assert (await storage.recent_matched(1))[0] == replace(ad, details_status="skipped")
 
 
 async def test_failed_batch_is_rolled_back(storage: Storage) -> None:

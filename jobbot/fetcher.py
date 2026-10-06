@@ -126,6 +126,19 @@ class Fetcher:
             raise RobotsDisallowedError(f"robots.txt запрещает {url}")
         return await self._get(url)
 
+    async def fetch_detail(self, ad_url: str) -> str:
+        """Загрузить страницу объявления `https://somon.tj/adv/<id>_<slug>/` (график, стаж и т.п.).
+
+        Те же правила, что и для разделов: только somon.tj, robots.txt, общая очередь запросов.
+        """
+        if not ad_url.startswith(f"{BASE_URL}/adv/") or "?" in ad_url:
+            raise ValueError(f"не похоже на ссылку объявления: {ad_url}")
+        check_url_allowed(ad_url)
+        await self._ensure_robots()
+        if not self._robots_allows(ad_url):
+            raise RobotsDisallowedError(f"robots.txt запрещает {ad_url}")
+        return await self._get(ad_url)
+
     async def refresh_robots(self) -> None:
         """Принудительно перечитать robots.txt."""
         parser = RobotFileParser()
