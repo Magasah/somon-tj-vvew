@@ -13,14 +13,14 @@
 
 ## Текущий статус
 
-- **Этап:** v1.1 «фильтры через кнопки» — 9.3 готов, далее 9.4. Ветка `feature/filters`. v1.0 (этапы 0–8) работает в проде
-- **Готово этапов:** v1.0: 9 из 9 (0–8); v1.1: 3 из 9 (9.1–9.3)
+- **Этап:** v1.1 «фильтры через кнопки» — 9.4 готов, далее 9.5. Ветка `feature/filters`. v1.0 (этапы 0–8) работает в проде
+- **Готово этапов:** v1.0: 9 из 9 (0–8); v1.1: 4 из 9 (9.1–9.4)
 - **Последнее обновление:** 2026-10-06
 - **Бот запущен в проде:** да — Railway, проект `charismatic-vitality`, сервис `somon-tj-vvew`, том `/app/data`; бот `@somontjvvew_bot`
 
 ## Следующий шаг
 
-9.4 (раздел 6 `TZ_update_filters.md`): двухступенчатый отбор — новый модуль отбора (ступень 1 по карточке: категория в профиле, город `city_norm` ∈ `cities` или пусто, зарплата — пересечение диапазонов `a_max ≥ f_min и a_min ≤ f_max` с пустыми краями, «Договорная» ↔ `include_negotiable`, нераспознанное ↔ `include_unknown_attrs`, слова include/exclude как сейчас; ступень 2 по `AdDetails`: `schedules`/`experience` по нормализованным значениям, нет значения ↔ `include_unknown_attrs`), `details_status` (`skipped`, если график/стаж не выбраны; иначе `pending`), справочник `attr_values` (`INSERT … ON CONFLICT DO UPDATE seen_count+1, last_seen`). Тесты: каждый фильтр отдельно, комбинация, `include_unknown_attrs` вкл/выкл, «Договорная», ≥6 случаев пересечения диапазонов, детали не нужны без графика/стажа.
+9.5 (раздел 6 п. 5–8 и 8 `TZ_update_filters.md`): перевести `poller.py` на профиль — опрашивать только разделы, которые и видимы (`settings.visible_keys`), и выбраны в `FilterProfile.categories` (старая таблица `categories` остаётся для режима ключевых слов `all/keywords`); новые объявления: `check_card` → `matched` + `details_status` (`initial_details_status`), запись значений в `attr_values`; после списков — очередь `pending` (новые первыми, не больше `MAX_DETAILS_PER_CYCLE`) через `Fetcher.fetch_detail` → `parse_detail` → столбцы `schedule/experience/company/sphere`, `check_details`; ошибка → `details_attempts += 1`, после 3 → `failed` и отправка с пометкой «⚠️ график/стаж не проверены». Решить, как `pending` не попадает в `unsent_matched` (досылку). Тест на respx: 15 новых + фильтр стажа → за цикл ровно 10 деталей, остальные в следующем; 3 неудачи → отправка с пометкой; дублей нет.
 
 Поддержка v1.0 (не забыть): владелец перевыпускает токен у @BotFather (`/revoke`) и обновляет его в Railway и `.env`.
 
@@ -43,7 +43,7 @@
 | 9.1 | Исследование реального HTML | ✅ готов | 30 страниц объявлений (15 it + 15 students) скачано через `Fetcher.fetch_detail`; 3 фикстуры `tests/fixtures/detail_*.html`; значения и селекторы — в «Заметках по парсеру»; `test_detail_page_selectors` проверяет селекторы на фикстурах; `pytest` 201 passed |
 | 9.2 | Каталог, модель, миграция v2 | ✅ готов | `tests/test_migration.py`: база v1 с данными → v2: старые данные (ads/keywords/state) байт-в-байт, профиль из включённых категорий, копия в `backups/`; повторный запуск ничего не меняет и не делает второй копии; `tests/test_filters.py` — каталог, настройки, модель; `pytest` 240 passed |
 | 9.3 | Парсинг v2 (нормализация, зарплата, детали) | ✅ готов | `tests/test_parsing_v2.py`: 22 случая `parse_salary` (+ пустые и нераспознанные с WARNING, все зарплаты с реальных страниц распознаны), нормализация с таджикскими буквами и синонимами городов, `city_norm` карточки, `parse_detail` на 3 фикстурах + метки/отсутствие/длина; `pytest` 303 passed |
-| 9.4 | Отбор v2 (двухступенчатый) | ⬜ | — |
+| 9.4 | Отбор v2 (двухступенчатый) | ✅ готов | `tests/test_selection.py`: каждый фильтр отдельно, комбинация, `include_unknown_attrs` вкл/выкл, «Договорная» (4 случая), пересечение диапазонов (15 случаев), детали не нужны без графика/стажа, справочник `attr_values`; `pytest` 348 passed |
 | 9.5 | Опрос v2 (категории, очередь деталей) | ⬜ | — |
 | 9.6 | Меню фильтров (кнопки, FSM) | ⬜ | — |
 | 9.7 | Карточка уведомления v2 | ⬜ | — |
@@ -85,11 +85,12 @@
 | `jobbot/catalog.py` | Каталог 26 разделов (`CATALOG`, `CATALOG_BY_KEY`, слаги как на сайте), `parse_category_keys`, `SITE_URL`, `DEFAULT_VISIBLE` |
 | `jobbot/filters.py` | `SalaryFilter`, `FilterProfile` (валидация, лимиты, `needs_details`), `load_profile` (битые данные → умолчание + WARNING), `dump_profile` |
 | `jobbot/normalize.py` | `normalize_text` (регистр, `ё ӣ ӯ ҳ қ ғ ҷ`, скобки, пробелы/дефисы), `normalize_city`, `CITY_SYNONYMS` |
+| `jobbot/selection.py` | Отбор v2: `CardFacts`, `check_card` → `Decision` (ACCEPT/REJECT/NEED_DETAILS), `city_ok`, `salary_ok`, `check_details`, `initial_details_status` |
 | `jobbot/models.py` | `Ad` (+ свойство `city_norm`), `Salary` (min/max/negotiable, `known`), `AdDetails` (график, стаж, город, сфера, компания) |
 | `jobbot/fetcher.py` | `Fetcher` (httpx, ≥3 с между запросами, повторы 2/4/8 с, 403/429 → `BlockedError`, robots.txt с кешем 24 ч, проверка адреса после редиректа), `fetch_page`, `fetch_detail` (страница объявления), `build_page_url`, `check_url_allowed` |
 | `jobbot/parser.py` | `parse_listing` (основной), `parse_listing_fallback` (запасной), `parse_page` → `ParseResult(ads, simplified)`; v1.1: `parse_salary` (+ `SALARY_BADGES`), `parse_detail` (+ `DETAIL_LABELS`) |
 | `jobbot/matcher.py` | `normalize()` (= `normalize_text` без удаления скобок), `contains_word()`, `matches(text, mode, include, exclude)`, `validate_keyword()` (+ лимиты слов) |
-| `jobbot/storage.py` | `Storage` (aiosqlite, WAL, миграции `MIGRATIONS` = функции v1, v2; копия базы `backup_database` перед миграцией): объявления, ключевые слова, разделы, `seed_defaults`, `state`, профиль фильтров (`get_filter_profile`, `update_profile`) |
+| `jobbot/storage.py` | `Storage` (aiosqlite, WAL, миграции `MIGRATIONS` = функции v1, v2; копия базы `backup_database` перед миграцией): объявления (+ разобранные зарплата/город), ключевые слова, разделы, `seed_defaults`, `state`, профиль фильтров (`get_filter_profile`, `update_profile`), справочник `record_attr_values`/`get_attr_values` |
 | `jobbot/notifier.py` | `format_card`, `card_keyboard`, `format_seed_header`, `format_digest`, `Notifier` (`send_text`, `send_ads` → список доставленных `ad_id`; пауза ≥1 с, повтор на `TelegramRetryAfter`) |
 | `jobbot/poller.py` | `Poller`: `poll_once()` (под `asyncio.Lock`, None если уже идёт), `run_forever(stop)`, `next_delay()`, `flush_unsent(since)`; seed, многостраничность, пауза, пауза 30 мин после 403/429, самодиагностика и служебные уведомления (`_alert`) |
 | `tests/fixtures/it_page1.html`, `students_page1.html` | Реальные страницы разделов (скачаны 2026-10-05) |
@@ -108,6 +109,7 @@
 | `tests/test_migration.py` | Миграция v1 → v2 на копии базы v1 с данными, бэкап, идемпотентность, профиль в базе |
 | `tests/test_filters.py` | Каталог, настройки v1.1, модель `FilterProfile` |
 | `tests/test_parsing_v2.py` | Нормализация, `parse_salary`, город карточки, `parse_detail` |
+| `tests/test_selection.py` | Отбор v2 и справочник `attr_values` |
 | `tests/test_poller.py` | Тесты poller: seed, дубли, новые, фильтры, страницы, пауза, сбои отправки, ошибки, блокировка, lock, самодиагностика и уведомления |
 | `tests/test_fetcher.py` | Тесты fetcher через respx: задержка, повторы, 403/429, robots |
 
@@ -223,6 +225,9 @@ docker compose restart
 - 2026-10-05 · Fetcher: после редиректа итоговый URL проверяется `check_url_allowed` (только somon.tj, без запрещённых путей и параметров), иначе `FetchError` · `follow_redirects=True` из ТЗ сохранён.
 - 2026-10-05 · `pyproject.toml`: `pythonpath = ["."]` — без этого голый `pytest` на Linux (CI) не видел пакет `jobbot` (локально работал `python -m pytest`).
 - 2026-10-05 · Railway: `RAILWAY_RUN_UID=0` (иначе пользователь uid 1000 не может писать в том Railway; в CI и docker-compose контейнер остаётся не-root). Том `/app/data` создан через CLI.
+- 2026-10-06 · Отбор v2 — отдельный модуль `selection.py` с чистыми функциями (без базы и сети): одинаково для новых объявлений и для подсчёта «подходит за 7 дней» в меню. Ключевые слова — как в v1.0: режим `all/keywords` берётся из старой таблицы `categories` (`/categories`), в профиль не переносился.
+- 2026-10-06 · Зарплата: граница фильтра не задана → неизвестная зарплата проходит (фильтра нет); `include_unknown_attrs` решает только при заданных «от»/«до». «Договорная» не сравнивается с границами — только переключатель `include_negotiable`. Город: пустой список = все города, даже при `include_unknown_attrs=False`; значения профиля дополнительно прогоняются через `normalize_city` (страховка от «Куляб» в профиле).
+- 2026-10-06 · `attr_values`: значение города нормализуется `normalize_city` (синонимы склеиваются: «Куляб»/«Кӯлоб» → `кулоб`), графика/стажа — `normalize_text`; подпись кнопки — первая встреченная; `seen_count` растёт при каждой записи (записывать только для новых объявлений, иначе счётчик будет расти от повторных просмотров — учесть на 9.5).
 - 2026-10-06 · Одна нормализация на всё (`normalize_text`): ключевые слова и заголовки тоже получили таджикские буквы и схлопывание дефисов, но для заголовков текст в скобках НЕ удаляется (`drop_brackets=False`) — иначе «Курьер (Python)» потерял бы слово python. Старые слова в базе совместимы (в них нет таджикских букв/двойных дефисов).
 - 2026-10-06 · `parse_salary`/`parse_detail` — в `parser.py` (там же весь разбор HTML); `Salary`/`AdDetails` — в `models.py`. Зарплата: одиночная цена → min=max; «от A до B» и перепутанные края диапазона упорядочиваются; валюта необязательна (`c`, `с`, `сом`, `сомони`, `tjs`, `смн`). Значки VIP/ТОП/TOP/Срочно/Премиум снимаются в начале строки, в том числе склеенные и несколько подряд.
 - 2026-10-06 · `parse_detail`: метки сравниваются после нормализации без двоеточия; пары берутся из `dt`/`dd` блока `AdvertFeaturesApp`, а если его нет — из любых `dt`/`dd` страницы (переживёт смену обёртки); город — из блока `AdvertLocationApp`, если в парах его нет. Значения хранятся как на сайте (для показа), нормализуются при сравнении.
@@ -269,6 +274,12 @@ docker compose restart
 > - Файлы: …
 > - Проверка: команда → ожидаемый результат
 > - Заметки: …
+
+### 2026-10-06 · v1.1 · 9.4 Отбор v2
+- Сделано: `selection.py` — ступень 1 по карточке (категория, город, зарплата с пересечением диапазонов, «Договорная», ключевые слова как раньше), ступень 2 по странице объявления (график, стаж), решение о `details_status`; справочник значений `Storage.record_attr_values`/`get_attr_values`.
+- Файлы: `jobbot/selection.py`, `jobbot/storage.py`, `tests/test_selection.py`.
+- Проверка: `pytest` → 348 passed (было 303); `ruff check .`/`ruff format --check .` → чисто.
+- Заметки: в опрос ещё не подключено — это 9.5.
 
 ### 2026-10-06 · v1.1 · 9.3 Парсинг v2
 - Сделано: `normalize.py` (таджикские буквы, скобки, синонимы городов), `parse_salary` (значки, «от/до», диапазоны, «Договорная», нераспознанное → WARNING), `Ad.city_norm`, `parse_detail` (график, стаж, город, сфера, компания), `Salary`/`AdDetails`; `matcher.normalize` переведён на общую нормализацию; `add_ads` и миграция v2 заполняют `salary_*` и `city_norm`.

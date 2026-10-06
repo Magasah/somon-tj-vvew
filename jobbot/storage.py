@@ -24,12 +24,14 @@ from jobbot.config import Category
 from jobbot.filters import FilterProfile, dump_profile, load_profile
 from jobbot.matcher import normalize
 from jobbot.models import Ad
-from jobbot.normalize import normalize_city
+from jobbot.normalize import normalize_city, normalize_text
 from jobbot.parser import parse_salary
 
 log = logging.getLogger("storage")
 
 KeywordKind = Literal["include", "exclude"]
+AttrName = Literal["city", "schedule", "experience"]
+ATTR_LABEL_MAX = 60
 
 # Версия 1 — схема из раздела 7 ТЗ.
 _V1_SQL: tuple[str, ...] = (
@@ -159,6 +161,15 @@ SCHEMA_VERSION = len(MIGRATIONS)
 SKIPPED_SENT_AT = "0000-00-00T00:00:00Z"
 
 _DEFAULTS_SEEDED = "defaults_seeded"
+
+
+@dataclass(frozen=True, slots=True)
+class AttrValue:
+    """Значение из справочника `attr_values` (для кнопок меню фильтров)."""
+
+    value_norm: str
+    label: str
+    seen_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,6 +312,45 @@ class Storage:
                 (dump_profile(profile),),
             )
         return profile
+
+    # ---------- справочник значений для кнопок (v1.1) ----------
+
+    async def record_attr_values(
+        self, attr: AttrName, labels: Iterable[str | None], *, now: datetime | None = None
+    ) -> None:
+        """Запомнить встреченные на сайте значения города/графика/стажа.
+
+        Повтор того же значения увеличивает `seen_count` (по нему сортируются кнопки).
+        Подпись (`label`) остаётся та, что встретилась первой.
+        """
+        stamp = to_iso(now)
+        rows = []
+        for label in labels:
+            if not label:
+                continue
+            clean = " ".join(label.split())[:ATTR_LABEL_MAX]
+            value_norm = normalize_city(clean) if attr == "city" else normalize_text(clean)
+            if value_norm:
+                rows.append((attr, value_norm, clean, stamp))
+        if not rows:
+            return
+        async with self._tx() as db:
+            await db.executemany(
+                "INSERT INTO attr_values (attr, value_norm, label, seen_count, last_seen) "
+                "VALUES (?, ?, ?, 1, ?) "
+                "ON CONFLICT(attr, value_norm) DO UPDATE SET "
+                "seen_count = seen_count + 1, last_seen = excluded.last_seen",
+                rows,
+            )
+
+    async def get_attr_values(self, attr: AttrName, limit: int = 50) -> list[AttrValue]:
+        """Значения для кнопок: самые частые первыми."""
+        rows = await self._fetchall(
+            "SELECT value_norm, label, seen_count FROM attr_values WHERE attr = ? "
+            "ORDER BY seen_count DESC, label LIMIT ?",
+            (attr, limit),
+        )
+        return [AttrValue(r["value_norm"], r["label"], r["seen_count"]) for r in rows]
 
     # ---------- объявления ----------
 
