@@ -224,3 +224,24 @@ async def test_update_profile_concurrent_changes_are_not_lost(tmp_path: Path) ->
         assert sorted((await store.get_filter_profile()).cities) == sorted(names)
     finally:
         await store.close()
+
+
+async def test_read_filters_readonly(tmp_path: Path) -> None:
+    from jobbot.storage import read_filters_readonly
+
+    assert read_filters_readonly(tmp_path / "нет.db") is None
+    db_path = tmp_path / "jobbot.db"
+    make_v1_database(db_path, enabled=("it",))  # старая база: профиля ещё нет
+    before = db_path.read_bytes()
+    snapshot = read_filters_readonly(db_path)
+    assert snapshot is not None
+    assert snapshot.profile == FilterProfile()  # таблицы профиля нет → умолчание
+    assert snapshot.include == ["python"] and snapshot.exclude == ["колл-центр"]
+    assert snapshot.modes == {"it": "all", "students": "all"}
+    assert db_path.read_bytes() == before  # база не тронута (без миграции и записи)
+
+    store = await Storage.open(db_path)
+    await store.update_profile(lambda p: setattr(p, "experience", ["без опыта"]))
+    await store.close()
+    snapshot = read_filters_readonly(db_path)
+    assert snapshot is not None and snapshot.profile.experience == ["без опыта"]

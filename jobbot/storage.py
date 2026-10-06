@@ -684,6 +684,38 @@ def from_iso(value: str) -> datetime:
     return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
 
 
+@dataclass(frozen=True, slots=True)
+class FiltersSnapshot:
+    """Фильтры из базы для режима `--dry-run` (база только читается)."""
+
+    profile: FilterProfile
+    include: list[str]
+    exclude: list[str]
+    modes: dict[str, str]
+
+
+def read_filters_readonly(db_path: str | Path) -> FiltersSnapshot | None:
+    """Прочитать профиль, слова и режимы, ничего не меняя в базе. Нет базы → None."""
+    path = Path(db_path)
+    if not path.is_file():
+        return None
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as conn:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        raw = None
+        if "filter_profile" in tables:
+            row = conn.execute("SELECT data FROM filter_profile WHERE id = 1").fetchone()
+            raw = row[0] if row else None
+        words: dict[str, list[str]] = {"include": [], "exclude": []}
+        if "keywords" in tables:
+            for kind, word in conn.execute("SELECT kind, word FROM keywords ORDER BY word"):
+                words[kind].append(word)
+        modes = {}
+        if "categories" in tables:
+            modes = dict(conn.execute("SELECT key, mode FROM categories"))
+    return FiltersSnapshot(load_profile(raw), words["include"], words["exclude"], modes)
+
+
 async def backup_database(db_path: Path, *, now: datetime | None = None) -> Path:
     """Копия базы перед миграцией: `<папка базы>/backups/<имя>-<UTC-время>.db`.
 
