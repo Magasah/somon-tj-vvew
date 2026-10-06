@@ -64,20 +64,89 @@ def make_notifier(bot: FakeBot, sleep: FakeSleep, threshold: int = 8) -> Notifie
 # ---------- форматирование ----------
 
 
-def test_card_format_matches_spec() -> None:
+def test_card_v1_fields_only() -> None:
+    # объявление без страницы (график/стаж не нужны): зарплата, город, раздел
     text = format_card(make_ad(), TITLES["it"])
     assert text == (
-        "💼 <b>.NET Backend разработчик</b>\n"
-        "💰 5 000 c. · 📍 Душанбе · 🕒 Сегодня\n"
-        "🏷 IT, телеком, компьютеры"
+        "💼 <b>.NET Backend разработчик</b>\n💰 5 000 c. · 📍 Душанбе\n🗂 IT, телеком, компьютеры"
     )
 
 
-def test_card_skips_missing_fields() -> None:
-    text = format_card(make_ad(salary_text=None, city=None, date_label="Вчера"), "Раздел")
-    assert text == "💼 <b>.NET Backend разработчик</b>\n🕒 Вчера\n🏷 Раздел"
-    bare = format_card(make_ad(salary_text=None, city=None, date_label=None), "Раздел")
-    assert bare.count("\n") == 1  # только заголовок и раздел
+def test_card_v2_all_fields() -> None:
+    ad = make_ad(
+        title="Junior Python разработчик",
+        salary_text="VIP2 000 - 3 000 c.",
+        schedule="Полный день",
+        experience="Без опыта",
+        company="Компания",
+        details_status="ok",
+    )
+    assert format_card(ad, "IT, телеком") == (
+        "💼 <b>Junior Python разработчик</b>\n"
+        "💰 2 000–3 000 c. · 📍 Душанбе\n"
+        "🕒 Полный день · 🎓 Без опыта\n"
+        "🏢 Компания · 🗂 IT, телеком"
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_lines"),
+    [
+        (
+            {"salary_text": None, "city": None},
+            ["💼 <b>.NET Backend разработчик</b>", "🗂 Раздел"],
+        ),
+        (
+            {"salary_text": "Договорная", "city": None, "schedule": "Удаленно"},
+            ["💼 <b>.NET Backend разработчик</b>", "💰 Договорная", "🕒 Удаленно", "🗂 Раздел"],
+        ),
+        (
+            {"salary_text": None, "experience": "Любой", "company": "  "},
+            [
+                "💼 <b>.NET Backend разработчик</b>",
+                "📍 Душанбе",
+                "🎓 Любой стаж",
+                "🗂 Раздел",
+            ],
+        ),
+        (
+            {"salary_text": "от 3 000 c.", "company": "ООО Ромашка"},
+            [
+                "💼 <b>.NET Backend разработчик</b>",
+                "💰 от 3 000 c. · 📍 Душанбе",
+                "🏢 ООО Ромашка · 🗂 Раздел",
+            ],
+        ),
+        (
+            {"salary_text": "по договорённости после собеседования"},  # формат не распознан
+            [
+                "💼 <b>.NET Backend разработчик</b>",
+                "💰 по договорённости после собеседования · 📍 Душанбе",
+                "🗂 Раздел",
+            ],
+        ),
+    ],
+)
+def test_card_partial_fields_have_no_empty_parts(
+    overrides: dict, expected_lines: list[str]
+) -> None:
+    text = format_card(make_ad(**overrides), "Раздел")
+    assert text.split("\n") == expected_lines
+    assert "None" not in text and " ·  " not in text and "· \n" not in text
+
+
+def test_card_unchecked_mark() -> None:
+    ad = make_ad(details_status="failed")
+    text = format_card(ad, "Раздел")
+    assert text.splitlines()[-1] == "⚠️ график/стаж не проверены"
+    assert "не проверены" not in format_card(make_ad(details_status="ok"), "Раздел")
+
+
+def test_card_v2_fields_are_escaped() -> None:
+    ad = make_ad(schedule="<b>Ночной</b>", experience="<i>1</i>", company="A & B <script>")
+    text = format_card(ad, "Раздел")
+    assert "&lt;b&gt;Ночной&lt;/b&gt;" in text and "&lt;i&gt;1&lt;/i&gt;" in text
+    assert "A &amp; B &lt;script&gt;" in text and "<script>" not in text
 
 
 def test_card_escapes_everything_from_site() -> None:
