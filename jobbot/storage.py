@@ -109,6 +109,14 @@ _V2_SQL: tuple[str, ...] = (
 )
 
 
+async def _close_unwanted_pending(db: aiosqlite.Connection) -> None:
+    """Объявления в очереди, которые больше никто не ждёт, — из очереди."""
+    await db.execute(
+        "UPDATE ads SET details_status = 'skipped' WHERE details_status = 'pending' "
+        "AND ad_id NOT IN (SELECT ad_id FROM deliveries WHERE status = 'waiting')"
+    )
+
+
 async def _migration_v1(db: aiosqlite.Connection) -> None:
     for statement in _V1_SQL:
         await db.execute(statement)
@@ -149,10 +157,67 @@ async def _migration_v2(db: aiosqlite.Connection) -> None:
     )
 
 
+# Версия 3 (v1.2, друзья): пользователи, приглашения по @username, заявки, доставки.
+# deliveries.chat_id = 0 — владелец (только ожидание страницы объявления; отправка владельцу
+# по-прежнему через ads.matched/sent_at, как в v1.0).
+_V3_SQL: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        chat_id   INTEGER PRIMARY KEY,
+        username  TEXT,
+        name      TEXT,
+        status    TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused', 'blocked')),
+        can_edit  INTEGER NOT NULL DEFAULT 0,
+        profile   TEXT NOT NULL,
+        added_at  TEXT NOT NULL,
+        paused_at TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)",
+    """
+    CREATE TABLE IF NOT EXISTS invites (
+        username TEXT PRIMARY KEY,
+        added_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS access_requests (
+        chat_id      INTEGER PRIMARY KEY,
+        username     TEXT,
+        name         TEXT,
+        status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'declined')),
+        requested_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS deliveries (
+        ad_id      INTEGER NOT NULL,
+        chat_id    INTEGER NOT NULL,
+        status     TEXT NOT NULL CHECK (status IN ('ready', 'waiting', 'rejected')),
+        created_at TEXT NOT NULL,
+        sent_at    TEXT,
+        PRIMARY KEY (ad_id, chat_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_deliveries_chat ON deliveries(chat_id, status, sent_at)",
+)
+
+
+async def _migration_v3(db: aiosqlite.Connection) -> None:
+    for statement in _V3_SQL:
+        await db.execute(statement)
+    # Объявления, которые до v1.2 ждали страницу, ждали её для владельца.
+    await db.execute(
+        "INSERT OR IGNORE INTO deliveries (ad_id, chat_id, status, created_at) "
+        "SELECT ad_id, 0, 'waiting', first_seen_at FROM ads WHERE details_status = 'pending'"
+    )
+
+
 # Миграции по порядку: номер версии = индекс + 1. Каждая выполняется в общей транзакции.
 MIGRATIONS: tuple[Callable[[aiosqlite.Connection], Awaitable[None]], ...] = (
     _migration_v1,
     _migration_v2,
+    _migration_v3,
 )
 SCHEMA_VERSION = len(MIGRATIONS)
 
@@ -189,6 +254,60 @@ def to_iso(moment: datetime | None = None) -> str:
 
 
 MAX_DETAIL_ATTEMPTS = 3  # после стольких неудач страница объявления считается непроверенной
+
+
+OWNER_ID = 0  # chat_id владельца в таблице deliveries
+
+UserStatus = Literal["active", "paused", "blocked"]
+
+
+@dataclass(frozen=True, slots=True)
+class User:
+    """Друг, которому владелец открыл бота (v1.2)."""
+
+    chat_id: int
+    username: str | None
+    name: str | None
+    status: UserStatus
+    can_edit: bool  # может сам менять свои фильтры (кроме категорий)
+    profile: FilterProfile
+    added_at: str
+    paused_at: str | None = None
+
+    @property
+    def title(self) -> str:
+        """Как показывать в меню: имя и @username."""
+        parts = [self.name or ""] + ([f"@{self.username}"] if self.username else [])
+        return " ".join(p for p in parts if p) or str(self.chat_id)
+
+
+@dataclass(frozen=True, slots=True)
+class AccessRequest:
+    chat_id: int
+    username: str | None
+    name: str | None
+    requested_at: str
+
+
+def normalize_username(raw: str | None) -> str | None:
+    """`@Ivan_Petrov` → `ivan_petrov`; пусто → None."""
+    if not raw:
+        return None
+    value = raw.strip().lstrip("@").lower()
+    return value or None
+
+
+def _row_to_user(row: aiosqlite.Row) -> User:
+    return User(
+        chat_id=row["chat_id"],
+        username=row["username"],
+        name=row["name"],
+        status=row["status"],
+        can_edit=bool(row["can_edit"]),
+        profile=load_profile(row["profile"]),
+        added_at=row["added_at"],
+        paused_at=row["paused_at"],
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,6 +565,11 @@ class Storage:
     async def expire_pending_details(self, before: datetime) -> int:
         """Старые объявления из очереди больше не проверяем (их уже не отправить)."""
         async with self._tx() as db:
+            await db.execute(
+                "UPDATE deliveries SET status = 'rejected' WHERE status = 'waiting' AND ad_id IN "
+                "(SELECT ad_id FROM ads WHERE details_status = 'pending' AND first_seen_at < ?)",
+                (to_iso(before),),
+            )
             cursor = await db.execute(
                 "UPDATE ads SET details_status = 'skipped' "
                 "WHERE details_status = 'pending' AND first_seen_at < ?",
@@ -453,37 +577,71 @@ class Storage:
             )
             return cursor.rowcount
 
-    async def accept_pending_without_details(self) -> int:
-        """График/стаж сняли с фильтра — ожидающие объявления прошли карточку и подходят."""
-        async with self._tx() as db:
-            cursor = await db.execute(
-                "UPDATE ads SET details_status = 'skipped', matched = 1 "
-                "WHERE details_status = 'pending'"
-            )
-            return cursor.rowcount
+    async def release_waiting(self, chat_id: int) -> int:
+        """Получателю больше не нужны график/стаж: всё, что ждало страницу, подходит ему.
 
-    async def save_details(self, ad_id: int, details: AdDetails, *, matched: bool) -> None:
-        """Страница загружена: сохранить поля и решение по графику/стажу."""
+        Владельцу (chat_id = 0) ставится `matched = 1`, другу — доставка `ready`. Объявления,
+        которые больше никто не ждёт, выходят из очереди (`skipped`).
+        """
+        async with self._tx() as db:
+            if chat_id == OWNER_ID:
+                await db.execute(
+                    "UPDATE ads SET matched = 1 WHERE ad_id IN (SELECT ad_id FROM deliveries "
+                    "WHERE chat_id = 0 AND status = 'waiting')"
+                )
+            cursor = await db.execute(
+                "UPDATE deliveries SET status = 'ready' WHERE chat_id = ? AND status = 'waiting'",
+                (chat_id,),
+            )
+            released = cursor.rowcount
+            await _close_unwanted_pending(db)
+            return released
+
+    async def accept_pending_without_details(self) -> int:
+        """Совместимость с v1.1: график/стаж сняты у владельца."""
+        return await self.release_waiting(OWNER_ID)
+
+    async def waiting_for(self, ad_id: int) -> list[int]:
+        """Кто ждёт страницу этого объявления (0 — владелец)."""
+        rows = await self._fetchall(
+            "SELECT chat_id FROM deliveries WHERE ad_id = ? AND status = 'waiting'", (ad_id,)
+        )
+        return [r["chat_id"] for r in rows]
+
+    async def resolve_details(
+        self, ad_id: int, details: AdDetails, decisions: Mapping[int, bool]
+    ) -> None:
+        """Страница загружена: сохранить поля и решение для каждого, кто её ждал."""
         async with self._tx() as db:
             await db.execute(
                 "UPDATE ads SET schedule = ?, experience = ?, company = ?, sphere = ?, "
-                "city_norm = COALESCE(city_norm, ?), details_status = 'ok', matched = ? "
-                "WHERE ad_id = ?",
+                "city_norm = COALESCE(city_norm, ?), details_status = 'ok' WHERE ad_id = ?",
                 (
                     details.schedule,
                     details.experience,
                     details.company,
                     details.sphere,
                     normalize_city(details.city) if details.city else None,
-                    int(matched),
                     ad_id,
                 ),
             )
+            for chat_id, ok in decisions.items():
+                if chat_id == OWNER_ID:
+                    await db.execute("UPDATE ads SET matched = ? WHERE ad_id = ?", (int(ok), ad_id))
+                await db.execute(
+                    "UPDATE deliveries SET status = ? "
+                    "WHERE ad_id = ? AND chat_id = ? AND status = 'waiting'",
+                    ("ready" if ok else "rejected", ad_id, chat_id),
+                )
+
+    async def save_details(self, ad_id: int, details: AdDetails, *, matched: bool) -> None:
+        """Совместимость с v1.1: решение только для владельца."""
+        await self.resolve_details(ad_id, details, {OWNER_ID: matched})
 
     async def detail_failed(self, ad_id: int, *, permanent: bool = False) -> int:
         """Страница не загрузилась: +1 попытка; на 3-й (или сразу при `permanent`) — `failed`.
 
-        `failed` → объявление подходит (`matched = 1`) и уйдёт с пометкой «не проверено»:
+        `failed` → объявление подходит всем, кто его ждал, и уйдёт с пометкой «не проверено»:
         лучше лишнее уведомление, чем пропущенная вакансия. Возвращает число попыток.
         """
         async with self._tx() as db:
@@ -491,10 +649,20 @@ class Storage:
             row = await cursor.fetchone()
             attempts = (row[0] if row else 0) + 1
             if permanent or attempts >= MAX_DETAIL_ATTEMPTS:
+                cursor = await db.execute(
+                    "SELECT 1 FROM deliveries "
+                    "WHERE ad_id = ? AND chat_id = 0 AND status = 'waiting'",
+                    (ad_id,),
+                )
+                owner_waits = await cursor.fetchone() is not None
                 await db.execute(
-                    "UPDATE ads SET details_attempts = ?, details_status = 'failed', matched = 1 "
-                    "WHERE ad_id = ?",
-                    (attempts, ad_id),
+                    "UPDATE ads SET details_attempts = ?, details_status = 'failed', "
+                    "matched = CASE WHEN ? THEN 1 ELSE matched END WHERE ad_id = ?",
+                    (attempts, int(owner_waits), ad_id),
+                )
+                await db.execute(
+                    "UPDATE deliveries SET status = 'ready' WHERE ad_id = ? AND status = 'waiting'",
+                    (ad_id,),
                 )
             else:
                 await db.execute(
@@ -503,10 +671,248 @@ class Storage:
             return attempts
 
     async def drop_pending_detail(self, ad_id: int) -> None:
-        """Объявление удалено с сайта (404): не проверяем и не отправляем."""
+        """Объявление удалено с сайта (404): не проверяем и не отправляем никому."""
         async with self._tx() as db:
             await db.execute(
                 "UPDATE ads SET details_status = 'failed', matched = 0 WHERE ad_id = ?", (ad_id,)
+            )
+            await db.execute(
+                "UPDATE deliveries SET status = 'rejected' WHERE ad_id = ? AND status = 'waiting'",
+                (ad_id,),
+            )
+
+    # ---------- доставки друзьям (v1.2) ----------
+
+    async def add_deliveries(
+        self, rows: Iterable[tuple[int, int, str]], *, now: datetime | None = None
+    ) -> None:
+        """(ad_id, chat_id, 'ready'|'waiting') — кому подходит объявление; повтор не меняет."""
+        stamp = to_iso(now)
+        data = [(ad_id, chat_id, status, stamp) for ad_id, chat_id, status in rows]
+        if not data:
+            return
+        async with self._tx() as db:
+            await db.executemany(
+                "INSERT OR IGNORE INTO deliveries (ad_id, chat_id, status, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                data,
+            )
+
+    async def ready_for(self, chat_id: int, since: datetime) -> list[Ad]:
+        """Подходящие другу и ещё не отправленные объявления, найденные не раньше `since`."""
+        rows = await self._fetchall(
+            "SELECT a.ad_id, a.category_key, a.title, a.url, a.salary_text, a.city, "
+            "a.date_label, a.schedule, a.experience, a.company, a.sphere, a.details_status "
+            "FROM deliveries d JOIN ads a ON a.ad_id = d.ad_id "
+            "WHERE d.chat_id = ? AND d.status = 'ready' AND d.sent_at IS NULL "
+            "AND a.first_seen_at >= ? ORDER BY a.first_seen_at, a.ad_id",
+            (chat_id, to_iso(since)),
+        )
+        return [_row_to_ad(r) for r in rows]
+
+    async def mark_delivered(
+        self, chat_id: int, ad_ids: Iterable[int], *, now: datetime | None = None
+    ) -> None:
+        """Отметить доставку другу (если записи не было — создать уже отправленной)."""
+        stamp = to_iso(now)
+        rows = [(ad_id, chat_id, stamp, stamp) for ad_id in ad_ids]
+        if not rows:
+            return
+        async with self._tx() as db:
+            await db.executemany(
+                "INSERT INTO deliveries (ad_id, chat_id, status, created_at, sent_at) "
+                "VALUES (?, ?, 'ready', ?, ?) "
+                "ON CONFLICT(ad_id, chat_id) DO UPDATE SET status = 'ready', "
+                "sent_at = excluded.sent_at",
+                rows,
+            )
+
+    async def count_delivered_since(self, chat_id: int, since: datetime) -> int:
+        row = await self._fetchone(
+            "SELECT COUNT(*) FROM deliveries WHERE chat_id = ? AND sent_at >= ?",
+            (chat_id, to_iso(since)),
+        )
+        return int(row[0]) if row else 0
+
+    # ---------- друзья (v1.2) ----------
+
+    async def list_users(self) -> list[User]:
+        rows = await self._fetchall("SELECT * FROM users ORDER BY added_at, chat_id")
+        return [_row_to_user(r) for r in rows]
+
+    async def get_user(self, chat_id: int) -> User | None:
+        row = await self._fetchone("SELECT * FROM users WHERE chat_id = ?", (chat_id,))
+        return _row_to_user(row) if row else None
+
+    async def find_user_by_username(self, username: str) -> User | None:
+        row = await self._fetchone(
+            "SELECT * FROM users WHERE username = ?", (normalize_username(username),)
+        )
+        return _row_to_user(row) if row else None
+
+    async def add_user(
+        self,
+        chat_id: int,
+        *,
+        username: str | None = None,
+        name: str | None = None,
+        profile: FilterProfile | None = None,
+        now: datetime | None = None,
+    ) -> bool:
+        """Открыть доступ. False — пользователь уже есть (ничего не меняется)."""
+        async with self._tx() as db:
+            cursor = await db.execute(
+                "INSERT OR IGNORE INTO users (chat_id, username, name, profile, added_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    chat_id,
+                    normalize_username(username),
+                    (name or "")[:64] or None,
+                    dump_profile(profile or FilterProfile()),
+                    to_iso(now),
+                ),
+            )
+            added = cursor.rowcount == 1
+            if added:
+                await db.execute("DELETE FROM access_requests WHERE chat_id = ?", (chat_id,))
+                if username:
+                    await db.execute(
+                        "DELETE FROM invites WHERE username = ?", (normalize_username(username),)
+                    )
+            return added
+
+    async def update_user_identity(
+        self, chat_id: int, username: str | None, name: str | None
+    ) -> None:
+        """Обновить @username и имя (они могут меняться в Telegram)."""
+        async with self._tx() as db:
+            await db.execute(
+                "UPDATE users SET username = ?, name = ? WHERE chat_id = ?",
+                (normalize_username(username), (name or "")[:64] or None, chat_id),
+            )
+
+    async def set_user_status(
+        self, chat_id: int, status: UserStatus, *, now: datetime | None = None
+    ) -> None:
+        async with self._tx() as db:
+            await db.execute(
+                "UPDATE users SET status = ?, paused_at = ? WHERE chat_id = ?",
+                (status, to_iso(now) if status == "paused" else None, chat_id),
+            )
+
+    async def set_user_can_edit(self, chat_id: int, can_edit: bool) -> None:
+        async with self._tx() as db:
+            await db.execute(
+                "UPDATE users SET can_edit = ? WHERE chat_id = ?", (int(can_edit), chat_id)
+            )
+
+    async def delete_user(self, chat_id: int) -> None:
+        async with self._tx() as db:
+            await db.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
+            await db.execute("DELETE FROM deliveries WHERE chat_id = ?", (chat_id,))
+
+    async def get_user_profile(self, chat_id: int) -> FilterProfile:
+        user = await self.get_user(chat_id)
+        return user.profile if user else FilterProfile()
+
+    async def update_user_profile(
+        self, chat_id: int, mutator: Callable[[FilterProfile], FilterProfile | None]
+    ) -> FilterProfile:
+        """Как `update_profile`, но для друга. Нет такого пользователя → KeyError."""
+        async with self._tx() as db:
+            cursor = await db.execute("SELECT profile FROM users WHERE chat_id = ?", (chat_id,))
+            row = await cursor.fetchone()
+            if row is None:
+                raise KeyError(chat_id)
+            draft = load_profile(row["profile"]).model_copy(deep=True)
+            changed = mutator(draft) or draft
+            profile = FilterProfile.model_validate(changed.model_dump())
+            await db.execute(
+                "UPDATE users SET profile = ? WHERE chat_id = ?", (dump_profile(profile), chat_id)
+            )
+        return profile
+
+    # ---------- приглашения по @username и заявки ----------
+
+    async def add_invite(self, username: str, *, now: datetime | None = None) -> bool:
+        value = normalize_username(username)
+        if not value:
+            return False
+        async with self._tx() as db:
+            cursor = await db.execute(
+                "INSERT OR IGNORE INTO invites (username, added_at) VALUES (?, ?)",
+                (value, to_iso(now)),
+            )
+            return cursor.rowcount == 1
+
+    async def list_invites(self) -> list[str]:
+        rows = await self._fetchall("SELECT username FROM invites ORDER BY added_at, username")
+        return [r["username"] for r in rows]
+
+    async def has_invite(self, username: str | None) -> bool:
+        value = normalize_username(username)
+        if not value:
+            return False
+        return (
+            await self._fetchone("SELECT 1 FROM invites WHERE username = ?", (value,)) is not None
+        )
+
+    async def delete_invite(self, username: str) -> None:
+        async with self._tx() as db:
+            await db.execute(
+                "DELETE FROM invites WHERE username = ?", (normalize_username(username),)
+            )
+
+    async def record_request(
+        self, chat_id: int, username: str | None, name: str | None, *, now: datetime | None = None
+    ) -> bool:
+        """Незнакомец написал боту. True — заявка новая (владельцу сообщить один раз)."""
+        async with self._tx() as db:
+            cursor = await db.execute(
+                "INSERT OR IGNORE INTO access_requests (chat_id, username, name, requested_at) "
+                "VALUES (?, ?, ?, ?)",
+                (chat_id, normalize_username(username), (name or "")[:64] or None, to_iso(now)),
+            )
+            return cursor.rowcount == 1
+
+    async def list_requests(self) -> list[AccessRequest]:
+        rows = await self._fetchall(
+            "SELECT chat_id, username, name, requested_at FROM access_requests "
+            "WHERE status = 'pending' ORDER BY requested_at DESC"
+        )
+        return [
+            AccessRequest(r["chat_id"], r["username"], r["name"], r["requested_at"]) for r in rows
+        ]
+
+    async def get_request(self, chat_id: int) -> AccessRequest | None:
+        row = await self._fetchone(
+            "SELECT chat_id, username, name, requested_at FROM access_requests "
+            "WHERE chat_id = ? AND status = 'pending'",
+            (chat_id,),
+        )
+        return (
+            AccessRequest(row["chat_id"], row["username"], row["name"], row["requested_at"])
+            if row
+            else None
+        )
+
+    async def find_request_by_username(self, username: str) -> AccessRequest | None:
+        row = await self._fetchone(
+            "SELECT chat_id, username, name, requested_at FROM access_requests "
+            "WHERE username = ? AND status = 'pending'",
+            (normalize_username(username),),
+        )
+        return (
+            AccessRequest(row["chat_id"], row["username"], row["name"], row["requested_at"])
+            if row
+            else None
+        )
+
+    async def decline_request(self, chat_id: int) -> None:
+        """Отклонить: больше не беспокоить владельца этим человеком."""
+        async with self._tx() as db:
+            await db.execute(
+                "UPDATE access_requests SET status = 'declined' WHERE chat_id = ?", (chat_id,)
             )
 
     async def ads_since(self, since: datetime) -> list[StoredAd]:

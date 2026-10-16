@@ -470,8 +470,13 @@ async def test_stranger_cannot_use_menu(menu: Menu) -> None:
     await menu.open()
     answers = len(menu.tg.answers)
     await menu.press_data(menu.data_of("📍 Город"), chat_id=STRANGER)
+    assert len(menu.tg.answers) == answers  # нажатие чужого — молча мимо
     await menu.say("/filters", chat_id=STRANGER)
-    assert len(menu.tg.answers) == answers and len(menu.tg.sent_ids) == 1
+    # меню не открылось: ушли только заявка владельцу и короткий ответ незнакомцу
+    texts = [menu.tg.messages[i][0] for i in menu.tg.sent_ids[1:]]
+    assert len(texts) == 2 and "Заявка на доступ" in texts[0]
+    assert not any("Ваши фильтры" in t for t in texts)
+    assert (await menu.profile()).cities == []
 
 
 async def test_stale_menu(menu: Menu) -> None:

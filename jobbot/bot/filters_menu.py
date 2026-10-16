@@ -1,8 +1,13 @@
-"""Меню фильтров на кнопках (v1.1, раздел 7 TZ_update_filters.md).
+"""Меню фильтров на кнопках (v1.1, раздел 7 TZ_update_filters.md; v1.2 — профили друзей).
 
-Одно сообщение, которое редактируется на месте. Каждое нажатие сразу сохраняет профиль через
-`Storage.update_profile` (под блокировкой, в одной транзакции). Данным из callback не верим:
-действие проверяется по списку, значения — по короткому хешу среди текущих вариантов.
+Одно сообщение, которое редактируется на месте. Каждое нажатие сразу сохраняет профиль
+(под блокировкой, в одной транзакции). Данным из callback не верим: действие проверяется по
+списку, значения — по короткому хешу среди текущих вариантов, чей профиль — по правам.
+
+Чьи фильтры открыты (поле `u` в callback):
+- `u = 0` — свои фильтры владельца (все экраны, включая ключевые слова);
+- `u = <chat_id друга>`, нажимает владелец — фильтры друга (все экраны, кроме ключевых слов);
+- `u = <свой chat_id>`, нажимает друг — свои фильтры, если владелец разрешил (без категорий).
 """
 
 from __future__ import annotations
@@ -44,7 +49,7 @@ from jobbot.matcher import MAX_WORDS_PER_LIST, validate_keyword
 from jobbot.models import Ad
 from jobbot.normalize import normalize_city, normalize_text
 from jobbot.selection import matches_profile
-from jobbot.storage import AttrName, KeywordKind
+from jobbot.storage import OWNER_ID, AttrName, KeywordKind, Storage, User
 
 if TYPE_CHECKING:
     from jobbot.bot.handlers import BotDeps
@@ -69,10 +74,14 @@ SITE_ANY_EXPERIENCE = "любой"  # так сайт пишет стаж, ко�
 
 
 class FilterCB(CallbackData, prefix="flt"):
-    """callback_data меню: действие + короткий аргумент (ключ, индекс или хеш), ≤ 64 байт."""
+    """callback_data меню: действие + аргумент (ключ, индекс или хеш) + чей профиль, ≤ 64 байт.
+
+    u = 0 — свой профиль владельца; иначе chat_id друга.
+    """
 
     a: str
     h: str = ""
+    u: int = 0
 
 
 class FilterInput(StatesGroup):
@@ -85,6 +94,38 @@ class FilterInput(StatesGroup):
 class Option:
     value: str  # нормализованное значение (как в профиле)
     label: str  # подпись на кнопке
+
+
+@dataclass(frozen=True, slots=True)
+class Target:
+    """Чей профиль открыт в меню и кто его правит (v1.2)."""
+
+    chat_id: int  # 0 — владелец
+    editor_owner: bool  # правит владелец (может всё) или сам друг (без категорий)
+    heading: str
+
+    @property
+    def is_owner_profile(self) -> bool:
+        return self.chat_id == OWNER_ID
+
+    @property
+    def can_categories(self) -> bool:
+        return self.editor_owner
+
+    @property
+    def keywords(self) -> bool:
+        return self.is_owner_profile  # у друзей ключевых слов нет
+
+
+OWNER_TARGET = Target(OWNER_ID, True, "⚙️ <b>Ваши фильтры</b>")
+
+
+def friend_target_for_owner(user: User) -> Target:
+    return Target(user.chat_id, True, f"⚙️ <b>Фильтры: {esc(user.title)}</b>")
+
+
+def friend_self_target(user: User) -> Target:
+    return Target(user.chat_id, False, "⚙️ <b>Ваши фильтры</b>")
 
 
 def short_hash(value: str) -> str:
@@ -126,8 +167,8 @@ def filters_reply_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def button(text: str, action: str, arg: str = "") -> InlineKeyboardButton:
-    return InlineKeyboardButton(text=text, callback_data=FilterCB(a=action, h=arg).pack())
+def button(text: str, action: str, arg: str = "", u: int = 0) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=FilterCB(a=action, h=arg, u=u).pack())
 
 
 def pairs(buttons: list[InlineKeyboardButton]) -> list[list[InlineKeyboardButton]]:
@@ -138,7 +179,81 @@ def mark(selected: bool) -> str:
     return "✅" if selected else "▫️"
 
 
+def experience_label(label: str, value: str, attr: AttrName) -> str:
+    if attr == "experience" and value == SITE_ANY_EXPERIENCE:
+        return "Любой стаж (так на сайте)"
+    return label
+
+
 Screen = tuple[str, InlineKeyboardMarkup | None]
+
+
+async def matching_for(storage: Storage, chat_id: int, window: timedelta) -> list[Ad]:
+    """Подходящие получателю вакансии из базы за `window` (новые первыми).
+
+    Владелец (chat_id = 0) — со своими ключевыми словами и режимами разделов; друг — только
+    по фильтрам профиля.
+    """
+    if chat_id == OWNER_ID:
+        profile = await storage.get_filter_profile()
+        include = await storage.get_keywords("include")
+        exclude = await storage.get_keywords("exclude")
+        modes = {c.key: c.mode for c in await storage.get_categories()}
+    else:
+        profile = await storage.get_user_profile(chat_id)
+        include, exclude, modes = [], [], {}
+    items = await storage.ads_since(datetime.now(UTC) - window)
+    return [
+        item.ad
+        for item in items
+        if matches_profile(
+            item,
+            profile,
+            keyword_mode=modes.get(item.ad.category_key, "all"),
+            include=include,
+            exclude=exclude,
+        )
+    ]
+
+
+async def profile_summary(storage: Storage, profile: FilterProfile, *, keywords: bool) -> str:
+    """Сводка фильтров (для меню, карточки друга в /admin и /start друга)."""
+
+    async def labels_for(attr: AttrName, values: list[str]) -> list[str]:
+        known = {v.value_norm: v.label for v in await storage.get_attr_values(attr, limit=200)}
+        return [experience_label(known.get(v, v.capitalize()), v, attr) for v in values]
+
+    categories = " · ".join(
+        esc(CATALOG_BY_KEY[k].title) for k in profile.categories if k in CATALOG_BY_KEY
+    )
+    cities = ", ".join(map(esc, await labels_for("city", profile.cities))) or "Все"
+    schedules = ", ".join(map(esc, await labels_for("schedule", profile.schedules))) or "Любой"
+    experience = ", ".join(map(esc, await labels_for("experience", profile.experience))) or "Любой"
+    negotiable = "показывать" if profile.salary.include_negotiable else "скрывать"
+    unknown = "показывать" if profile.include_unknown_attrs else "скрывать"
+    lines = [
+        f"🗂 Категории: {categories}",
+        f"📍 Город: {cities}",
+        f"💰 Зарплата: {salary_range_text(profile.salary)} · «Договорная» — {negotiable}",
+        f"🕒 График: {schedules}",
+        f"🎓 Стаж: {experience}",
+    ]
+    if keywords:
+        include = await storage.get_keywords("include")
+        exclude = await storage.get_keywords("exclude")
+        words = " · ".join(
+            part for part in (_word_list("+", include), _word_list("−", exclude)) if part
+        )
+        lines.append(f"🔤 Слова: {words or 'нет'}")
+    lines.append(f"❔ Если поле не указано: {unknown}")
+    return "\n".join(lines)
+
+
+def _word_list(sign: str, words: list[str], limit: int = 6) -> str:
+    shown = ", ".join(f"{sign}{esc(w)}" for w in words[:limit])
+    if len(words) > limit:
+        shown += f" и ещё {len(words) - limit}"
+    return shown
 
 
 def create_filters_router(deps: BotDeps) -> Router:
@@ -146,10 +261,35 @@ def create_filters_router(deps: BotDeps) -> Router:
     router = Router(name="filters-menu")
     storage, settings = deps.storage, deps.settings
 
-    # ---------- данные для экранов ----------
+    # ---------- чей профиль ----------
 
     def visible_keys() -> tuple[str, ...]:
         return settings.visible_keys
+
+    async def get_profile(t: Target) -> FilterProfile:
+        if t.is_owner_profile:
+            return await storage.get_filter_profile()
+        return await storage.get_user_profile(t.chat_id)
+
+    async def update(t: Target, change: Callable[[FilterProfile], FilterProfile | None]) -> None:
+        if t.is_owner_profile:
+            await storage.update_profile(change)
+        else:
+            await storage.update_user_profile(t.chat_id, change)
+
+    async def resolve_target(u: int, role: str | None, friend: User | None) -> Target | None:
+        """Право на профиль из callback: владелец — на свой и любого друга, друг — на свой."""
+        if role == "owner":
+            if u == OWNER_ID:
+                return OWNER_TARGET
+            user = await storage.get_user(u)
+            return friend_target_for_owner(user) if user else None
+        if role == "friend" and friend is not None and u == friend.chat_id and friend.can_edit:
+            fresh = await storage.get_user(friend.chat_id)
+            return friend_self_target(fresh) if fresh and fresh.can_edit else None
+        return None
+
+    # ---------- данные для экранов ----------
 
     async def value_options(attr: AttrName, selected: list[str], limit: int) -> list[Option]:
         """Варианты кнопок: частые значения с сайта + уже выбранные (чтобы их можно было снять)."""
@@ -166,120 +306,74 @@ def create_filters_router(deps: BotDeps) -> Router:
                 options.append(Option(value, value.capitalize()))
         return options
 
-    async def labels_for(attr: AttrName, values: list[str]) -> list[str]:
-        known = {v.value_norm: v.label for v in await storage.get_attr_values(attr, limit=200)}
-        return [experience_label(known.get(v, v.capitalize()), v, attr) for v in values]
-
-    def experience_label(label: str, value: str, attr: AttrName) -> str:
-        if attr == "experience" and value == SITE_ANY_EXPERIENCE:
-            return "Любой стаж (так на сайте)"
-        return label
-
-    async def matching_ads(window: timedelta) -> list[Ad]:
-        profile = await storage.get_filter_profile()
-        include = await storage.get_keywords("include")
-        exclude = await storage.get_keywords("exclude")
-        modes = {c.key: c.mode for c in await storage.get_categories()}
-        items = await storage.ads_since(datetime.now(UTC) - window)
-        return [
-            item.ad
-            for item in items
-            if matches_profile(
-                item,
-                profile,
-                keyword_mode=modes.get(item.ad.category_key, "all"),
-                include=include,
-                exclude=exclude,
-            )
-        ]
-
-    async def summary(profile: FilterProfile) -> str:
-        categories = " · ".join(
-            esc(CATALOG_BY_KEY[k].title) for k in profile.categories if k in CATALOG_BY_KEY
-        )
-        cities = ", ".join(map(esc, await labels_for("city", profile.cities))) or "Все"
-        schedules = ", ".join(map(esc, await labels_for("schedule", profile.schedules))) or "Любой"
-        experience = (
-            ", ".join(map(esc, await labels_for("experience", profile.experience))) or "Любой"
-        )
-        negotiable = "показывать" if profile.salary.include_negotiable else "скрывать"
-        include = await storage.get_keywords("include")
-        exclude = await storage.get_keywords("exclude")
-        words = " · ".join(
-            part for part in (word_list("+", include), word_list("−", exclude)) if part
-        )
-        unknown = "показывать" if profile.include_unknown_attrs else "скрывать"
-        return (
-            f"🗂 Категории: {categories}\n"
-            f"📍 Город: {cities}\n"
-            f"💰 Зарплата: {salary_range_text(profile.salary)} · «Договорная» — {negotiable}\n"
-            f"🕒 График: {schedules}\n"
-            f"🎓 Стаж: {experience}\n"
-            f"🔤 Слова: {words or 'нет'}\n"
-            f"❔ Если поле не указано: {unknown}"
-        )
-
-    def word_list(sign: str, words: list[str], limit: int = 6) -> str:
-        shown = ", ".join(f"{sign}{esc(w)}" for w in words[:limit])
-        if len(words) > limit:
-            shown += f" и ещё {len(words) - limit}"
-        return shown
+    def b(t: Target, text: str, action: str, arg: str = "") -> InlineKeyboardButton:
+        return button(text, action, arg, t.chat_id)
 
     # ---------- экраны ----------
 
-    async def main_screen() -> Screen:
-        profile = await storage.get_filter_profile()
-        count = len(await matching_ads(CHECK_WINDOW))
+    async def main_screen(t: Target) -> Screen:
+        profile = await get_profile(t)
+        count = len(await matching_for(storage, t.chat_id, CHECK_WINDOW))
         text = (
-            "⚙️ <b>Ваши фильтры</b>\n\n"
-            + await summary(profile)
+            f"{t.heading}\n\n"
+            + await profile_summary(storage, profile, keywords=t.keywords)
             + f"\n\nПодходит за последние 7 дней: {count} {plural_vacancies(count)}"
         )
+        if not t.can_categories:
+            text += "\n\n<i>Категории настраивает владелец бота.</i>"
+        first_row = [b(t, "📍 Город", "city")]
+        if t.can_categories:
+            first_row.insert(0, b(t, "🗂 Категории", "cat"))
+        third_row = [b(t, "🎓 Стаж", "exp")]
+        if t.keywords:
+            third_row.append(b(t, "🔤 Ключевые слова", "kw"))
         keyboard = [
-            [button("🗂 Категории", "cat"), button("📍 Город", "city")],
-            [button("💰 Зарплата", "sal"), button("🕒 График", "sch")],
-            [button("🎓 Стаж", "exp"), button("🔤 Ключевые слова", "kw")],
-            [button("🔍 Проверить фильтр", "chk"), button("♻️ Сбросить", "rst")],
-            [button("✅ Готово", "done")],
+            first_row,
+            [b(t, "💰 Зарплата", "sal"), b(t, "🕒 График", "sch")],
+            third_row,
+            [b(t, "🔍 Проверить фильтр", "chk"), b(t, "♻️ Сбросить", "rst")],
+            [b(t, "✅ Готово", "done")],
         ]
+        if not t.is_owner_profile and t.editor_owner:
+            keyboard.append([user_card_button(t.chat_id)])
         return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-    def back(target: str = "home") -> list[InlineKeyboardButton]:
-        return [button("⬅️ Назад", target)]
+    def back(t: Target, target: str = "home") -> list[InlineKeyboardButton]:
+        return [b(t, "⬅️ Назад", target)]
 
-    async def categories_screen() -> Screen:
-        profile = await storage.get_filter_profile()
+    async def categories_screen(t: Target) -> Screen:
+        profile = await get_profile(t)
         rows = [
-            [button(f"{mark(k in profile.categories)} {CATALOG_BY_KEY[k].title}", "ct", k)]
+            [b(t, f"{mark(k in profile.categories)} {CATALOG_BY_KEY[k].title}", "ct", k)]
             for k in visible_keys()
         ]
         text = "🗂 <b>Категории</b>\nВыберите разделы, из которых присылать вакансии."
-        return text, InlineKeyboardMarkup(inline_keyboard=[*rows, back()])
+        return text, InlineKeyboardMarkup(inline_keyboard=[*rows, back(t)])
 
-    async def city_screen() -> Screen:
-        profile = await storage.get_filter_profile()
+    async def city_screen(t: Target) -> Screen:
+        profile = await get_profile(t)
         options = await value_options("city", profile.cities, MAX_CITY_BUTTONS)
         selected = {normalize_city(c) for c in profile.cities}
         buttons = [
-            button(f"{mark(o.value in selected)} {o.label}", "cy", short_hash(o.value))
+            b(t, f"{mark(o.value in selected)} {o.label}", "cy", short_hash(o.value))
             for o in options
         ]
         rows = [
-            [button(f"{mark(not profile.cities)} 🌍 Все города", "ca")],
+            [b(t, f"{mark(not profile.cities)} 🌍 Все города", "ca")],
             *pairs(buttons),
-            back(),
+            back(t),
         ]
         text = "📍 <b>Город</b>\nМожно выбрать несколько. «Все города» снимает выбор."
         return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
-    async def salary_screen() -> Screen:
-        profile = await storage.get_filter_profile()
+    async def salary_screen(t: Target) -> Screen:
+        profile = await get_profile(t)
         salary = profile.salary
         presets = []
         for index, amount in enumerate(SALARY_PRESETS):
             current = salary.max is None and salary.min == amount
             label = "Любая" if amount is None else f"от {money(amount)}"
-            presets.append(button(f"{mark(current)} {label}", "sp", str(index)))
+            presets.append(b(t, f"{mark(current)} {label}", "sp", str(index)))
         negotiable = (
             "«Договорная»: показывать ✅"
             if salary.include_negotiable
@@ -287,9 +381,9 @@ def create_filters_router(deps: BotDeps) -> Router:
         )
         rows = [
             *pairs(presets),
-            [button("✏️ Ввести вручную", "sm")],
-            [button(negotiable, "sn")],
-            back(),
+            [b(t, "✏️ Ввести вручную", "sm")],
+            [b(t, negotiable, "sn")],
+            back(t),
         ]
         text = (
             "💰 <b>Зарплата, c.</b>\n"
@@ -298,15 +392,16 @@ def create_filters_router(deps: BotDeps) -> Router:
         )
         return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
-    async def values_screen(attr: AttrName) -> Screen:
-        profile = await storage.get_filter_profile()
+    async def values_screen(t: Target, attr: AttrName) -> Screen:
+        profile = await get_profile(t)
         selected = profile.schedules if attr == "schedule" else profile.experience
         options = await value_options(attr, selected, MAX_VALUE_BUTTONS)
-        toggle, any_action = ("st", "sa") if attr == "schedule" else ("et", "ea")
+        toggle_action, any_action = ("st", "sa") if attr == "schedule" else ("et", "ea")
         buttons = [
-            button(
+            b(
+                t,
                 f"{mark(o.value in selected)} {experience_label(o.label, o.value, attr)}",
-                toggle,
+                toggle_action,
                 short_hash(o.value),
             )
             for o in options
@@ -317,10 +412,10 @@ def create_filters_router(deps: BotDeps) -> Router:
             else "Если не указано: скрывать ▫️"
         )
         rows = [
-            [button(f"{mark(not selected)} Любой", any_action)],
+            [b(t, f"{mark(not selected)} Любой", any_action)],
             *pairs(buttons),
-            [button(unknown, "unk", attr[:3])],
-            back(),
+            [b(t, unknown, "unk", attr[:3])],
+            back(t),
         ]
         title = "🕒 <b>График</b>" if attr == "schedule" else "🎓 <b>Стаж</b>"
         text = f"{title}\nМожно выбрать несколько.\n\n<i>{VALUES_HINT}</i>"
@@ -331,7 +426,7 @@ def create_filters_router(deps: BotDeps) -> Router:
         text += "\nЕсли выбрать график или стаж, бот будет открывать страницы вакансий (медленнее)."
         return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
-    async def keywords_screen() -> Screen:
+    async def keywords_screen(t: Target) -> Screen:
         include = await storage.get_keywords("include")
         exclude = await storage.get_keywords("exclude")
         text = (
@@ -342,18 +437,21 @@ def create_filters_router(deps: BotDeps) -> Router:
             "с режимом keywords (/categories)."
         )
         rows = [
-            [button("➕ Добавить нужное слово", "ki")],
-            [button("➖ Добавить стоп-слово", "ke")],
-            [button("🗑 Удалить слово", "kd")],
-            back(),
+            [b(t, "➕ Добавить нужное слово", "ki")],
+            [b(t, "➖ Добавить стоп-слово", "ke")],
+            [b(t, "🗑 Удалить слово", "kd")],
+            back(t),
         ]
         return clip(text), InlineKeyboardMarkup(inline_keyboard=rows)
 
-    async def delete_words_screen() -> Screen:
+    async def delete_words_screen(t: Target) -> Screen:
         entries = await keyword_entries()
         buttons = [
-            button(
-                f"{'➕' if kind == 'include' else '➖'} {word}", "kx", short_hash(f"{kind}:{word}")
+            b(
+                t,
+                f"{'➕' if kind == 'include' else '➖'} {word}",
+                "kx",
+                short_hash(f"{kind}:{word}"),
             )
             for kind, word in entries[:MAX_DELETE_BUTTONS]
         ]
@@ -362,15 +460,15 @@ def create_filters_router(deps: BotDeps) -> Router:
             text += "\n\nСписки пусты."
         if len(entries) > MAX_DELETE_BUTTONS:
             text += f"\nПоказаны первые {MAX_DELETE_BUTTONS}; остальные: /remove слово"
-        return text, InlineKeyboardMarkup(inline_keyboard=[*pairs(buttons), back("kw")])
+        return text, InlineKeyboardMarkup(inline_keyboard=[*pairs(buttons), back(t, "kw")])
 
     async def keyword_entries() -> list[tuple[KeywordKind, str]]:
         include = await storage.get_keywords("include")
         exclude = await storage.get_keywords("exclude")
         return [("include", w) for w in include] + [("exclude", w) for w in exclude]
 
-    async def check_screen() -> Screen:
-        ads = await matching_ads(CHECK_WINDOW)
+    async def check_screen(t: Target) -> Screen:
+        ads = await matching_for(storage, t.chat_id, CHECK_WINDOW)
         if ads:
             lines = [f"🔍 <b>Подходит за 7 дней: {len(ads)}</b>. Последние:"]
             for ad in ads[:CHECK_SHOW]:
@@ -380,19 +478,21 @@ def create_filters_router(deps: BotDeps) -> Router:
             text = "\n".join(lines)
         else:
             text = "🔍 За последние 7 дней подходящих вакансий нет. Попробуйте ослабить фильтры."
-        rows = [[button("📨 Прислать все подходящие за 24 часа", "chs")], back()]
+        rows = [[b(t, "📨 Прислать все подходящие за 24 часа", "chs")], back(t)]
         return clip(text), InlineKeyboardMarkup(inline_keyboard=rows)
 
-    def reset_screen() -> Screen:
+    def reset_screen(t: Target) -> Screen:
+        keep = "Ключевые слова не изменятся." if t.keywords else "Категории не изменятся."
         text = (
             "♻️ <b>Сбросить фильтры?</b>\n"
-            "Категории, город, зарплата, график и стаж вернутся к начальным. "
-            "Ключевые слова не изменятся."
+            "Город, зарплата, график и стаж вернутся к начальным"
+            + (", категории — тоже. " if t.is_owner_profile else ". ")
+            + keep
         )
-        rows = [[button("Да, сбросить", "rsy"), button("Отмена", "home")]]
+        rows = [[b(t, "Да, сбросить", "rsy"), b(t, "Отмена", "home")]]
         return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
-    def input_screen(kind: str, error: str | None = None) -> Screen:
+    def input_screen(t: Target, kind: str, error: str | None = None) -> Screen:
         prompts = {
             "salary": f"✏️ Введите зарплату. {SALARY_INPUT_HELP}",
             "include": "➕ Напишите нужное слово (2–40 символов).",
@@ -402,17 +502,31 @@ def create_filters_router(deps: BotDeps) -> Router:
         if error:
             text = f"❌ {esc(error)}\n\n{text}"
         text += "\n\nДля выхода — кнопка «Отмена» или /cancel."
-        return text, InlineKeyboardMarkup(inline_keyboard=[[button("✖️ Отмена", "cx")]])
+        return text, InlineKeyboardMarkup(inline_keyboard=[[b(t, "✖️ Отмена", "cx")]])
+
+    async def done_screen(t: Target) -> Screen:
+        profile = await get_profile(t)
+        text = "✅ <b>Фильтры сохранены</b>\n\n" + await profile_summary(
+            storage, profile, keywords=t.keywords
+        )
+        if not t.is_owner_profile and t.editor_owner:
+            return text, InlineKeyboardMarkup(inline_keyboard=[[user_card_button(t.chat_id)]])
+        return text, None
 
     # ---------- изменение профиля ----------
 
-    async def mutate(query: CallbackQuery, change: Callable[[FilterProfile], None]) -> bool:
+    async def mutate(
+        query: CallbackQuery, t: Target, change: Callable[[FilterProfile], None]
+    ) -> bool:
         try:
-            await storage.update_profile(change)
+            await update(t, change)
         except ValidationError as exc:
             reason = exc.errors()[0]["msg"].removeprefix("Value error, ")
             message = reason[:1].upper() + reason[1:]
             await query.answer(message, show_alert=True)
+            return False
+        except KeyError:
+            await query.answer("Пользователь не найден, откройте /admin", show_alert=True)
             return False
         return True
 
@@ -449,9 +563,24 @@ def create_filters_router(deps: BotDeps) -> Router:
             if "message is not modified" not in str(exc):
                 raise
 
-    async def open_menu(message: Message, state: FSMContext) -> None:
+    async def open_menu(
+        message: Message, state: FSMContext, role: str | None, friend: User | None
+    ) -> None:
         await state.clear()
-        text, keyboard = await main_screen()
+        if role == "owner":
+            screen = await main_screen(OWNER_TARGET)
+        elif friend is not None and friend.can_edit:
+            screen = await main_screen(friend_self_target(friend))
+        elif friend is not None:
+            text = (
+                "⚙️ <b>Ваши фильтры</b>\n\n"
+                + await profile_summary(storage, friend.profile, keywords=False)
+                + "\n\n<i>Фильтры настраивает владелец бота.</i>"
+            )
+            screen = (text, None)
+        else:
+            return
+        text, keyboard = screen
         await message.answer(
             text,
             parse_mode=ParseMode.HTML,
@@ -462,40 +591,69 @@ def create_filters_router(deps: BotDeps) -> Router:
     # ---------- команды и кнопка ----------
 
     @router.message(Command("filters"))
-    async def cmd_filters(message: Message, state: FSMContext) -> None:
-        await open_menu(message, state)
+    async def cmd_filters(
+        message: Message,
+        state: FSMContext,
+        role: str | None = None,
+        friend: User | None = None,
+    ) -> None:
+        await open_menu(message, state, role, friend)
 
     @router.message(F.text == FILTERS_BUTTON)
-    async def on_filters_button(message: Message, state: FSMContext) -> None:
-        await open_menu(message, state)
+    async def on_filters_button(
+        message: Message,
+        state: FSMContext,
+        role: str | None = None,
+        friend: User | None = None,
+    ) -> None:
+        await open_menu(message, state, role, friend)
 
     @router.message(Command("cancel"))
-    async def cmd_cancel(message: Message, state: FSMContext, bot: Bot) -> None:
+    async def cmd_cancel(
+        message: Message,
+        state: FSMContext,
+        bot: Bot,
+        role: str | None = None,
+        friend: User | None = None,
+    ) -> None:
         data = await state.get_data()
         if await state.get_state() is None:
             await message.answer("Нечего отменять. Меню фильтров: /filters")
             return
         await state.clear()
-        if data.get("menu_id"):
-            await show_by_id(bot, message.chat.id, data["menu_id"], await screen_after(data))
+        t = await resolve_target(int(data.get("u", 0)), role, friend)
+        if data.get("menu_id") and t is not None and data.get("kind") in FILTER_INPUT_KINDS:
+            await show_by_id(bot, message.chat.id, data["menu_id"], await screen_after(t, data))
         await message.answer("Ввод отменён.")
 
-    async def screen_after(data: dict) -> Screen:
-        return await salary_screen() if data.get("kind") == "salary" else await keywords_screen()
+    async def screen_after(t: Target, data: dict) -> Screen:
+        if data.get("kind") == "salary":
+            return await salary_screen(t)
+        return await keywords_screen(t)
 
     # ---------- ввод текста (FSM) ----------
 
     not_command = F.text & ~F.text.startswith("/")
 
     @router.message(StateFilter(FilterInput.salary), not_command)
-    async def input_salary(message: Message, state: FSMContext, bot: Bot) -> None:
+    async def input_salary(
+        message: Message,
+        state: FSMContext,
+        bot: Bot,
+        role: str | None = None,
+        friend: User | None = None,
+    ) -> None:
         data = await state.get_data()
+        t = await resolve_target(int(data.get("u", 0)), role, friend)
         await try_delete(message)
+        if t is None:
+            await state.clear()
+            return
         try:
             low, high = parse_salary_input(message.text or "")
         except ValueError as exc:
             await show_by_id(
-                bot, message.chat.id, data["menu_id"], input_screen("salary", str(exc))
+                bot, message.chat.id, data["menu_id"], input_screen(t, "salary", str(exc))
             )
             return
 
@@ -504,25 +662,31 @@ def create_filters_router(deps: BotDeps) -> Router:
                 min=low, max=high, include_negotiable=profile.salary.include_negotiable
             )
 
-        await storage.update_profile(change)
+        await update(t, change)
         await state.clear()
-        await show_by_id(bot, message.chat.id, data["menu_id"], await salary_screen())
+        await show_by_id(bot, message.chat.id, data["menu_id"], await salary_screen(t))
 
     @router.message(StateFilter(FilterInput.include, FilterInput.exclude), not_command)
-    async def input_word(message: Message, state: FSMContext, bot: Bot) -> None:
+    async def input_word(
+        message: Message, state: FSMContext, bot: Bot, role: str | None = None
+    ) -> None:
         data = await state.get_data()
-        kind: KeywordKind = "include" if data.get("kind") == "include" else "exclude"
         await try_delete(message)
+        if role != "owner":
+            await state.clear()
+            return
+        t = OWNER_TARGET
+        kind: KeywordKind = "include" if data.get("kind") == "include" else "exclude"
         try:
             word = validate_keyword(message.text or "")
             if await storage.count_keywords(kind) >= MAX_WORDS_PER_LIST:
                 raise ValueError(f"В списке уже {MAX_WORDS_PER_LIST} слов — это максимум.")
         except ValueError as exc:
-            await show_by_id(bot, message.chat.id, data["menu_id"], input_screen(kind, str(exc)))
+            await show_by_id(bot, message.chat.id, data["menu_id"], input_screen(t, kind, str(exc)))
             return
         await storage.add_keyword(kind, word)
         await state.clear()
-        await show_by_id(bot, message.chat.id, data["menu_id"], await keywords_screen())
+        await show_by_id(bot, message.chat.id, data["menu_id"], await keywords_screen(t))
 
     async def try_delete(message: Message) -> None:
         """Убрать введённый текст из чата, чтобы не копились сообщения (не критично)."""
@@ -534,44 +698,58 @@ def create_filters_router(deps: BotDeps) -> Router:
     # ---------- нажатия кнопок ----------
 
     @router.callback_query(FilterCB.filter())
-    async def on_button(query: CallbackQuery, callback_data: FilterCB, state: FSMContext) -> None:
+    async def on_button(
+        query: CallbackQuery,
+        callback_data: FilterCB,
+        state: FSMContext,
+        role: str | None = None,
+        friend: User | None = None,
+    ) -> None:
         message = query.message
         if not isinstance(message, Message) or datetime.now(UTC) - message.date > MENU_TTL:
             await query.answer("Меню устарело, откройте /filters", show_alert=True)
             return
+        t = await resolve_target(callback_data.u, role, friend)
+        if t is None:
+            return await reject(query, callback_data.a, str(callback_data.u))
         action, arg = callback_data.a, callback_data.h
+
+        if action in OWNER_PROFILE_ONLY and not t.keywords:
+            return await reject(query, action, arg)
+        if action in CATEGORY_ACTIONS and not t.can_categories:
+            return await reject(query, action, arg)
 
         if action == "home":
             await state.clear()
-            await show(message, await main_screen())
+            await show(message, await main_screen(t))
         elif action == "cat":
-            await show(message, await categories_screen())
+            await show(message, await categories_screen(t))
         elif action == "ct":
             if arg not in visible_keys():
                 return await reject(query, action, arg)
             if not await mutate(
-                query, lambda p: setattr(p, "categories", toggle(p.categories, arg))
+                query, t, lambda p: setattr(p, "categories", toggle(p.categories, arg))
             ):
                 return None
-            await show(message, await categories_screen())
+            await show(message, await categories_screen(t))
         elif action == "city":
-            await show(message, await city_screen())
+            await show(message, await city_screen(t))
         elif action == "ca":
-            if not await mutate(query, lambda p: setattr(p, "cities", [])):
+            if not await mutate(query, t, lambda p: setattr(p, "cities", [])):
                 return None
-            await show(message, await city_screen())
+            await show(message, await city_screen(t))
         elif action == "cy":
-            profile = await storage.get_filter_profile()
+            profile = await get_profile(t)
             option = find(await value_options("city", profile.cities, MAX_CITY_BUTTONS), arg)
             if option is None:
-                return await stale_button(query, message, await city_screen())
+                return await stale_button(query, message, await city_screen(t))
             if not await mutate(
-                query, lambda p: setattr(p, "cities", toggle(p.cities, option.value))
+                query, t, lambda p: setattr(p, "cities", toggle(p.cities, option.value))
             ):
                 return None
-            await show(message, await city_screen())
+            await show(message, await city_screen(t))
         elif action == "sal":
-            await show(message, await salary_screen())
+            await show(message, await salary_screen(t))
         elif action == "sp":
             if not arg.isdigit() or int(arg) >= len(SALARY_PRESETS):
                 return await reject(query, action, arg)
@@ -580,9 +758,9 @@ def create_filters_router(deps: BotDeps) -> Router:
             def preset(p: FilterProfile) -> None:
                 p.salary = SalaryFilter(min=amount, include_negotiable=p.salary.include_negotiable)
 
-            if not await mutate(query, preset):
+            if not await mutate(query, t, preset):
                 return None
-            await show(message, await salary_screen())
+            await show(message, await salary_screen(t))
         elif action == "sn":
 
             def flip_negotiable(p: FilterProfile) -> None:
@@ -592,89 +770,97 @@ def create_filters_router(deps: BotDeps) -> Router:
                     include_negotiable=not p.salary.include_negotiable,
                 )
 
-            if not await mutate(query, flip_negotiable):
+            if not await mutate(query, t, flip_negotiable):
                 return None
-            await show(message, await salary_screen())
+            await show(message, await salary_screen(t))
         elif action == "sm":
             await state.set_state(FilterInput.salary)
-            await state.update_data(menu_id=message.message_id, kind="salary")
-            await show(message, input_screen("salary"))
+            await state.update_data(menu_id=message.message_id, kind="salary", u=t.chat_id)
+            await show(message, input_screen(t, "salary"))
         elif action in ("sch", "exp"):
             await show(
-                message, await values_screen("schedule" if action == "sch" else "experience")
+                message, await values_screen(t, "schedule" if action == "sch" else "experience")
             )
         elif action in ("st", "et"):
             attr: AttrName = "schedule" if action == "st" else "experience"
             field = "schedules" if attr == "schedule" else "experience"
-            profile = await storage.get_filter_profile()
+            profile = await get_profile(t)
             option = find(
                 await value_options(attr, getattr(profile, field), MAX_VALUE_BUTTONS), arg
             )
             if option is None:
-                return await stale_button(query, message, await values_screen(attr))
+                return await stale_button(query, message, await values_screen(t, attr))
             value = normalize_text(option.value)
             if not await mutate(
-                query, lambda p: setattr(p, field, toggle(getattr(p, field), value))
+                query, t, lambda p: setattr(p, field, toggle(getattr(p, field), value))
             ):
                 return None
-            await show(message, await values_screen(attr))
+            await show(message, await values_screen(t, attr))
         elif action in ("sa", "ea"):
             attr = "schedule" if action == "sa" else "experience"
             field = "schedules" if attr == "schedule" else "experience"
-            if not await mutate(query, lambda p: setattr(p, field, [])):
+            if not await mutate(query, t, lambda p: setattr(p, field, [])):
                 return None
-            await show(message, await values_screen(attr))
+            await show(message, await values_screen(t, attr))
         elif action == "unk":
             if arg not in ("sch", "exp"):
                 return await reject(query, action, arg)
             if not await mutate(
-                query, lambda p: setattr(p, "include_unknown_attrs", not p.include_unknown_attrs)
+                query,
+                t,
+                lambda p: setattr(p, "include_unknown_attrs", not p.include_unknown_attrs),
             ):
                 return None
-            await show(message, await values_screen("schedule" if arg == "sch" else "experience"))
+            await show(
+                message, await values_screen(t, "schedule" if arg == "sch" else "experience")
+            )
         elif action == "kw":
             await state.clear()
-            await show(message, await keywords_screen())
+            await show(message, await keywords_screen(t))
         elif action in ("ki", "ke"):
             kind = "include" if action == "ki" else "exclude"
             await state.set_state(FilterInput.include if kind == "include" else FilterInput.exclude)
-            await state.update_data(menu_id=message.message_id, kind=kind)
-            await show(message, input_screen(kind))
+            await state.update_data(menu_id=message.message_id, kind=kind, u=t.chat_id)
+            await show(message, input_screen(t, kind))
         elif action == "kd":
-            await show(message, await delete_words_screen())
+            await show(message, await delete_words_screen(t))
         elif action == "kx":
             entry = next(
                 (e for e in await keyword_entries() if short_hash(f"{e[0]}:{e[1]}") == arg), None
             )
             if entry is None:
-                return await stale_button(query, message, await delete_words_screen())
+                return await stale_button(query, message, await delete_words_screen(t))
             await storage.remove_keyword_from(entry[0], entry[1])
-            await show(message, await delete_words_screen())
+            await show(message, await delete_words_screen(t))
         elif action == "cx":
             data = await state.get_data()
             await state.clear()
-            await show(message, await screen_after(data))
+            await show(message, await screen_after(t, data))
         elif action == "chk":
-            await show(message, await check_screen())
+            await show(message, await check_screen(t))
         elif action == "chs":
             await query.answer("Отправляю…")
-            ads = await matching_ads(SEND_ALL_WINDOW)
+            ads = await matching_for(storage, t.chat_id, SEND_ALL_WINDOW)
             if not ads:
                 await message.answer("За последние 24 часа подходящих вакансий нет.")
                 return None
-            await deps.notifier.send_digest(ads[:SEND_ALL_LIMIT])
+            # Присылаем тому, кто нажал: владелец видит, что получил бы друг.
+            editor_chat = None if role == "owner" else message.chat.id
+            await deps.notifier.send_digest(ads[:SEND_ALL_LIMIT], chat_id=editor_chat)
             return None
         elif action == "rst":
-            await show(message, reset_screen())
+            await show(message, reset_screen(t))
         elif action == "rsy":
-            await storage.update_profile(lambda _p: FilterProfile())
-            await show(message, await main_screen())
+            if t.is_owner_profile:
+                await update(t, lambda _p: FilterProfile())
+            else:
+                await update(t, lambda p: FilterProfile(categories=p.categories))
+            await show(message, await main_screen(t))
             await query.answer("Фильтры сброшены")
             return None
         elif action == "done":
             await state.clear()
-            profile = await storage.get_filter_profile()
-            await show(message, ("✅ <b>Фильтры сохранены</b>\n\n" + await summary(profile), None))
+            await show(message, await done_screen(t))
         else:
             return await reject(query, action, arg)
         await query.answer()
@@ -697,3 +883,17 @@ def create_filters_router(deps: BotDeps) -> Router:
         await query.answer("Список обновился, нажмите ещё раз")
 
     return router
+
+
+FILTER_INPUT_KINDS = frozenset({"salary", "include", "exclude"})
+OWNER_PROFILE_ONLY = frozenset({"kw", "ki", "ke", "kd", "kx"})  # ключевые слова — только свои
+CATEGORY_ACTIONS = frozenset({"cat", "ct"})
+
+
+def user_card_button(chat_id: int) -> InlineKeyboardButton:
+    """Кнопка «к карточке друга» в /admin (callback админ-панели)."""
+    from jobbot.bot.admin import AdminCB
+
+    return InlineKeyboardButton(
+        text="⬅️ К пользователю", callback_data=AdminCB(a="usr", u=chat_id).pack()
+    )

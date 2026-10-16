@@ -14,7 +14,12 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 
 from jobbot.config import BASE_URL
@@ -169,6 +174,8 @@ class Notifier:
         self._threshold = digest_threshold
         self._sleep = sleep
         self._last_sent_at: float | None = None
+        # v1.2: чаты, которые запретили боту писать (друг заблокировал бота) — для poller.
+        self.forbidden: set[int] = set()
 
     async def send_text(
         self,
@@ -176,18 +183,27 @@ class Notifier:
         *,
         reply_markup: InlineKeyboardMarkup | None = None,
         preview: bool = False,
+        chat_id: int | None = None,
     ) -> None:
-        """Отправить одно сообщение (HTML). Ждёт паузу, при `TelegramRetryAfter` повторяет."""
+        """Отправить одно сообщение (HTML). Ждёт паузу, при `TelegramRetryAfter` повторяет.
+
+        `chat_id` — кому (по умолчанию владельцу).
+        """
+        target = self._chat_id if chat_id is None else chat_id
         for attempt in range(1, MAX_RETRY_AFTER_ATTEMPTS + 1):
             await self._pause()
             try:
                 await self._bot.send_message(
-                    chat_id=self._chat_id,
+                    chat_id=target,
                     text=text,
                     parse_mode=ParseMode.HTML,
                     reply_markup=reply_markup,
                     link_preview_options=LinkPreviewOptions(is_disabled=not preview),
                 )
+            except TelegramForbiddenError:
+                self._last_sent_at = time.monotonic()
+                self.forbidden.add(target)
+                raise
             except TelegramRetryAfter as exc:
                 self._last_sent_at = time.monotonic()
                 if attempt == MAX_RETRY_AFTER_ATTEMPTS:
@@ -205,6 +221,7 @@ class Notifier:
         *,
         header: str | None = None,
         simplified: bool = False,
+        chat_id: int | None = None,
     ) -> list[int]:
         """Отправить объявления и вернуть `ad_id` тех, что точно доставлены.
 
@@ -218,23 +235,23 @@ class Notifier:
         if not ads:
             return []
         if len(ads) > self._threshold:
-            return await self._send_digest(ads, simplified, header)
-        return await self._send_cards(ads, category_titles, simplified, header)
+            return await self._send_digest(ads, simplified, header, chat_id)
+        return await self._send_cards(ads, category_titles, simplified, header, chat_id)
 
-    async def send_digest(self, ads: Sequence[Ad]) -> list[int]:
+    async def send_digest(self, ads: Sequence[Ad], *, chat_id: int | None = None) -> list[int]:
         """Отправить объявления одним списком (дайджестом) независимо от их числа."""
         if not ads:
             return []
-        return await self._send_digest(ads, False, None)
+        return await self._send_digest(ads, False, None, chat_id)
 
     async def _send_digest(
-        self, ads: Sequence[Ad], simplified: bool, header: str | None
+        self, ads: Sequence[Ad], simplified: bool, header: str | None, chat_id: int | None
     ) -> list[int]:
         try:
             for text in format_digest(ads, simplified=simplified):
                 if header is not None:
                     text, header = f"{header}\n\n{text}", None
-                await self.send_text(text)
+                await self.send_text(text, chat_id=chat_id)
         except TelegramAPIError as exc:
             # Часть сообщений могла уйти — не знаем какая, поэтому не помечаем ничего:
             # лучше повтор, чем потеря.
@@ -248,6 +265,7 @@ class Notifier:
         category_titles: Mapping[str, str],
         simplified: bool,
         header: str | None,
+        chat_id: int | None,
     ) -> list[int]:
         sent: list[int] = []
         for ad in ads:
@@ -259,7 +277,7 @@ class Notifier:
             if header is not None:
                 text = f"{header}\n\n{text}"
             try:
-                await self.send_text(text, reply_markup=card_keyboard(ad))
+                await self.send_text(text, reply_markup=card_keyboard(ad), chat_id=chat_id)
             except TelegramBadRequest as exc:
                 log.error("объявление %d отклонено Telegram: %s", ad.ad_id, exc)
                 continue  # проблема в этом сообщении — остальные отправляем

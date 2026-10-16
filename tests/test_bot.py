@@ -143,9 +143,19 @@ async def add_ads(storage: Storage, count: int, matched: bool = True) -> None:
     "text", ["/start", "/status", "/check", "/pause", "/include python", "/last"]
 )
 async def test_stranger_gets_no_reply(h: Harness, text: str) -> None:
+    # v1.2: первое сообщение незнакомца — заявка: владельцу уведомление, человеку один ответ.
     await h.say(text, chat_id=STRANGER)
-    assert h.calls == []  # ни ответа, ни вызова Telegram вообще
+    sent = [c for c in h.calls if isinstance(c, SendMessage)]
+    assert [int(m.chat_id) for m in sent] == [OWNER, STRANGER]
+    assert "Заявка на доступ" in sent[0].text and str(STRANGER) in sent[0].text
+    assert "Заявка на доступ отправлена" in sent[1].text
+    # команда не выполнена, и повторные сообщения — полная тишина
     assert await h.storage.get_state("paused") is None
+    assert await h.storage.get_keywords("include") == sorted(DEFAULT_INCLUDE)
+    h.reset()
+    await h.say(text, chat_id=STRANGER)
+    await h.say("/start", chat_id=STRANGER)
+    assert h.calls == []
 
 
 async def test_stranger_cannot_press_buttons(h: Harness) -> None:
