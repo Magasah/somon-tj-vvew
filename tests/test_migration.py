@@ -65,7 +65,7 @@ async def test_v1_to_v2_keeps_data_and_creates_profile(tmp_path: Path) -> None:
 
     store = await Storage.open(db_path)
     try:
-        assert await store.schema_version() == SCHEMA_VERSION == 2
+        assert await store.schema_version() == SCHEMA_VERSION == 3
         profile = await store.get_filter_profile()
         assert profile.categories == ["it"]  # из включённых разделов v1
         assert profile == FilterProfile(categories=["it"])  # остальное — по умолчанию
@@ -123,7 +123,7 @@ async def test_second_open_changes_nothing(tmp_path: Path) -> None:
 
     store = await Storage.open(db_path)
     try:
-        assert await store.schema_version() == 2
+        assert await store.schema_version() == SCHEMA_VERSION
         assert (await store.get_filter_profile()).categories == ["it", "students"]
     finally:
         await store.close()
@@ -140,7 +140,7 @@ async def test_migration_survives_partially_added_columns(tmp_path: Path) -> Non
         conn.execute("ALTER TABLE ads ADD COLUMN city_norm TEXT")
     store = await Storage.open(db_path)
     try:
-        assert await store.schema_version() == 2
+        assert await store.schema_version() == SCHEMA_VERSION
     finally:
         await store.close()
 
@@ -159,7 +159,7 @@ async def test_fresh_database_gets_default_profile_and_no_backup(tmp_path: Path)
     db_path = tmp_path / "data" / "jobbot.db"
     store = await Storage.open(db_path)
     try:
-        assert await store.schema_version() == 2
+        assert await store.schema_version() == SCHEMA_VERSION
         assert await store.get_filter_profile() == FilterProfile()
     finally:
         await store.close()
@@ -245,3 +245,24 @@ async def test_read_filters_readonly(tmp_path: Path) -> None:
     await store.close()
     snapshot = read_filters_readonly(db_path)
     assert snapshot is not None and snapshot.profile.experience == ["без опыта"]
+
+
+async def test_v2_to_v3_keeps_pending_for_owner_and_adds_user_tables(tmp_path: Path) -> None:
+    db_path = tmp_path / "jobbot.db"
+    make_v1_database(db_path)
+    store = await Storage.open(db_path)  # v1 → v3 целиком
+    await store.close()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE ads SET details_status = 'pending' WHERE ad_id = 3")
+        conn.execute("DELETE FROM deliveries")
+        conn.execute("UPDATE schema_version SET version = 2")
+    store = await Storage.open(db_path)  # повторная миграция v2 → v3
+    try:
+        assert await store.schema_version() == SCHEMA_VERSION
+        assert await store.waiting_for(3) == [0]  # ожидание страницы — за владельцем
+        assert await store.list_users() == [] and await store.list_requests() == []
+    finally:
+        await store.close()
+    tables = {r[0] for r in table_dump(db_path, "SELECT name FROM sqlite_master")}
+    assert {"users", "invites", "access_requests", "deliveries"} <= tables
+    assert len(list((db_path.parent / "backups").glob("*.db"))) == 2  # копия перед каждой

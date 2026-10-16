@@ -13,7 +13,7 @@ import asyncio
 import html
 import logging
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -32,14 +32,8 @@ from jobbot.matcher import Mode
 from jobbot.models import Ad
 from jobbot.notifier import Notifier, format_seed_header
 from jobbot.parser import parse_detail, parse_page
-from jobbot.selection import (
-    CardFacts,
-    Decision,
-    check_card,
-    check_details,
-    initial_details_status,
-)
-from jobbot.storage import Storage, from_iso, to_iso
+from jobbot.selection import CardFacts, Decision, check_card, check_details
+from jobbot.storage import OWNER_ID, Storage, from_iso, to_iso
 
 log = logging.getLogger("poller")
 
@@ -60,6 +54,27 @@ EMPTY_STREAK_LIMIT = 3  # столько циклов подряд раздел 
 EMPTY_ALERT_INTERVAL = timedelta(hours=6)  # повторять не чаще
 NET_FAIL_LIMIT = 5  # столько сетевых ошибок подряд → одно уведомление
 ROBOTS_ALERT_INTERVAL = timedelta(hours=24)
+
+
+@dataclass(frozen=True)
+class Recipient:
+    """Кому раздаются вакансии: владелец (chat_id = 0) или друг (v1.2)."""
+
+    chat_id: int
+    profile: FilterProfile
+    modes: Mapping[str, Mode]  # режим ключевых слов по разделам (только у владельца)
+    include: list[str]
+    exclude: list[str]
+    paused: bool = False
+
+    def decide(self, ad: Ad) -> Decision:
+        return check_card(
+            CardFacts.from_ad(ad),
+            self.profile,
+            keyword_mode=self.modes.get(ad.category_key, "all"),
+            include=self.include,
+            exclude=self.exclude,
+        )
 
 
 @dataclass
@@ -149,6 +164,30 @@ class Poller:
 
     # ---------- один цикл ----------
 
+    async def _recipients(self) -> list[Recipient]:
+        """Кому раздаём вакансии: владелец + друзья (кроме заблокировавших бота)."""
+        owner = Recipient(
+            chat_id=OWNER_ID,
+            profile=await self._storage.get_filter_profile(),
+            modes={s.key: s.mode for s in await self._storage.get_categories()},
+            include=await self._storage.get_keywords("include"),
+            exclude=await self._storage.get_keywords("exclude"),
+            paused=await self._is_paused(),
+        )
+        friends = [
+            Recipient(
+                chat_id=user.chat_id,
+                profile=user.profile,
+                modes={},  # у друзей нет ключевых слов: только фильтры профиля
+                include=[],
+                exclude=[],
+                paused=user.status == "paused",
+            )
+            for user in await self._storage.list_users()
+            if user.status != "blocked"
+        ]
+        return [owner, *friends]
+
     async def _poll_cycle(self) -> CycleStats:
         stats = CycleStats()
         blocked_until = await self._storage.get_state(STATE_BLOCKED_UNTIL)
@@ -157,31 +196,20 @@ class Poller:
             stats.skipped = "blocked"
             return stats
 
-        include = await self._storage.get_keywords("include")
-        exclude = await self._storage.get_keywords("exclude")
-        profile = await self._storage.get_filter_profile()
-        # Режим ключевых слов (all/keywords) — по-прежнему из /categories.
-        modes = {s.key: s.mode for s in await self._storage.get_categories()}
+        recipients = await self._recipients()
         simplified_ids: set[int] = set()  # найдены запасным парсером → пометка в сообщении
-        # Опрашиваем только разделы, которые и видимы (VISIBLE_CATEGORIES), и выбраны в фильтре.
-        selected = [c for c in self._settings.categories if c.key in profile.categories]
+        # Опрашиваем только видимые разделы (VISIBLE_CATEGORIES), выбранные хоть у кого-то.
+        wanted = {key for r in recipients for key in r.profile.categories}
+        selected = [c for c in self._settings.categories if c.key in wanted]
         if not selected:
-            log.warning("ни один выбранный в фильтре раздел не входит в VISIBLE_CATEGORIES")
+            log.warning("ни один выбранный в фильтрах раздел не входит в VISIBLE_CATEGORIES")
         blocked = False
 
         for category in selected:
             cat_stats = CategoryStats(category.key)
             stats.categories.append(cat_stats)
             try:
-                await self._poll_category(
-                    category,
-                    profile,
-                    modes.get(category.key, "all"),
-                    include,
-                    exclude,
-                    cat_stats,
-                    simplified_ids,
-                )
+                await self._poll_category(category, recipients, cat_stats, simplified_ids)
             except BlockedError as exc:
                 cat_stats.error = str(exc)
                 await self._enter_block_pause(exc)
@@ -209,11 +237,15 @@ class Poller:
 
         if not blocked:
             try:
-                await self._process_details(profile, stats)
+                await self._process_details(recipients, stats)
             except Exception:
                 log.exception("ошибка в очереди страниц объявлений")
 
         await self._send_pending(stats=stats, simplified_ids=simplified_ids)
+        try:
+            await self._send_friends(recipients, stats, simplified_ids)
+        except Exception:
+            log.exception("ошибка при отправке друзьям")
         await self._storage.set_state(STATE_LAST_POLL, to_iso(self._now()))
         if stats.details_loaded:
             log.info("страниц объявлений загружено: %d", stats.details_loaded)
@@ -230,16 +262,13 @@ class Poller:
     async def _poll_category(
         self,
         category: Category,
-        profile: FilterProfile,
-        keyword_mode: Mode,
-        include: list[str],
-        exclude: list[str],
+        recipients: list[Recipient],
         stats: CategoryStats,
         simplified_ids: set[int],
     ) -> None:
         # Первый запуск раздела: в базе пусто → всё текущее сохраняем как уже просмотренное.
         seeding = not await self._storage.has_ads(category.key)
-        seed_pool: list[Ad] = []
+        seed_pools: dict[int, list[Ad]] = {r.chat_id: [] for r in recipients}
 
         for page in range(1, self._settings.max_pages + 1):
             page_html = await self._fetcher.fetch_page(category.url, page)
@@ -251,58 +280,68 @@ class Poller:
                 break
             stats.found += len(result.ads)
 
-            # Ступень 1 отбора — по карточке, без запросов к сайту.
+            # Ступень 1 отбора — по карточке, без запросов к сайту, для каждого получателя.
             decisions = {
-                ad.ad_id: check_card(
-                    CardFacts.from_ad(ad),
-                    profile,
-                    keyword_mode=keyword_mode,
-                    include=include,
-                    exclude=exclude,
-                )
-                for ad in result.ads
+                ad.ad_id: {r.chat_id: r.decide(ad) for r in recipients} for ad in result.ads
             }
-            items = [(ad, decisions[ad.ad_id] is Decision.ACCEPT) for ad in result.ads]
+            items = [(ad, decisions[ad.ad_id][OWNER_ID] is Decision.ACCEPT) for ad in result.ads]
             # При первом запуске страницы объявлений не грузим: это «тихое» запоминание.
             statuses = {
-                ad_id: "skipped" if seeding else initial_details_status(decision)
-                for ad_id, decision in decisions.items()
+                ad_id: (
+                    "pending"
+                    if not seeding and Decision.NEED_DETAILS in per.values()
+                    else "skipped"
+                )
+                for ad_id, per in decisions.items()
             }
             new = await self._storage.add_ads(
                 items, skip_sending=seeding, details_status=statuses, now=self._now()
             )
             stats.new += len(new)
             await self._storage.record_attr_values("city", [ad.city for ad in new], now=self._now())
+            rows: list[tuple[int, int, str]] = []
             for ad in new:
-                if decisions[ad.ad_id] is Decision.REJECT:
-                    continue
-                if seeding:
-                    seed_pool.append(ad)
-                elif result.simplified:
+                for chat_id, decision in decisions[ad.ad_id].items():
+                    if decision is Decision.REJECT:
+                        continue
+                    if seeding:
+                        seed_pools[chat_id].append(ad)
+                    elif decision is Decision.NEED_DETAILS:
+                        rows.append((ad.ad_id, chat_id, "waiting"))
+                    elif chat_id != OWNER_ID:
+                        rows.append((ad.ad_id, chat_id, "ready"))
+                if result.simplified and not seeding:
                     simplified_ids.add(ad.ad_id)
+            await self._storage.add_deliveries(rows, now=self._now())
 
             # Дальше листаем, только если на странице всё новое (бот долго был выключен).
             if len(new) < len(result.ads):
                 break
 
-        if seeding and seed_pool:
-            await self._send_seed(category, seed_pool, stats)
+        if seeding:
+            by_id = {r.chat_id: r for r in recipients}
+            for chat_id, pool in seed_pools.items():
+                if pool and not by_id[chat_id].paused:
+                    await self._send_seed(category, pool, stats, chat_id)
 
-    async def _process_details(self, profile: FilterProfile, stats: CycleStats) -> None:
+    async def _process_details(self, recipients: list[Recipient], stats: CycleStats) -> None:
         """Ступень 2: страницы объявлений из очереди (новые первыми, не больше лимита за цикл).
 
         Ошибка загрузки → ещё одна попытка в следующем цикле; после 3 неудач объявление
         отправляется с пометкой «график/стаж не проверены». Удалённое объявление (404/410)
-        не отправляется.
+        не отправляется. Решение принимается отдельно для каждого, кто ждал страницу.
         """
         now = self._now()
         await self._storage.expire_pending_details(now - UNSENT_WINDOW)
-        if not profile.needs_details:
-            accepted = await self._storage.accept_pending_without_details()
-            if accepted:
-                log.info("график/стаж сняты с фильтра: %d объявлений из очереди подходят", accepted)
+        for recipient in recipients:
+            if not recipient.profile.needs_details:
+                released = await self._storage.release_waiting(recipient.chat_id)
+                if released:
+                    log.info("график/стаж сняты с фильтра: %d объявлений подходят", released)
+        if not any(r.profile.needs_details for r in recipients):
             return
 
+        profiles = {r.chat_id: r.profile for r in recipients}
         queue = await self._storage.pending_details(
             now - UNSENT_WINDOW, self._settings.max_details_per_cycle
         )
@@ -336,21 +375,31 @@ class Poller:
             details = parse_detail(page_html)
             await self._storage.record_attr_values("schedule", [details.schedule], now=now)
             await self._storage.record_attr_values("experience", [details.experience], now=now)
-            await self._storage.save_details(
-                ad.ad_id, details, matched=check_details(details, profile)
-            )
+            decisions = {
+                chat_id: chat_id in profiles and check_details(details, profiles[chat_id])
+                for chat_id in await self._storage.waiting_for(ad.ad_id)
+            }
+            await self._storage.resolve_details(ad.ad_id, details, decisions)
             stats.details_loaded += 1
 
-    async def _send_seed(self, category: Category, pool: list[Ad], stats: CategoryStats) -> None:
-        """Первый запуск: показать владельцу только последние SEED_SEND_LAST вакансий раздела."""
+    async def _send_seed(
+        self, category: Category, pool: list[Ad], stats: CategoryStats, chat_id: int = OWNER_ID
+    ) -> None:
+        """Первый запуск раздела: показать получателю только последние SEED_SEND_LAST вакансий."""
         count = self._settings.seed_send_last
-        if count <= 0 or await self._is_paused():
+        if count <= 0:
             return
         newest = sorted(pool, key=lambda ad: ad.ad_id, reverse=True)[:count]  # больший id = свежее
         sent = await self._notifier.send_ads(
-            newest, self._titles, header=format_seed_header(category.title)
+            newest,
+            self._titles,
+            header=format_seed_header(category.title),
+            chat_id=None if chat_id == OWNER_ID else chat_id,
         )
-        await self._storage.mark_sent(sent, now=self._now())  # для счётчика в /status
+        if chat_id == OWNER_ID:
+            await self._storage.mark_sent(sent, now=self._now())  # для счётчика в /status
+        else:
+            await self._storage.mark_delivered(chat_id, sent, now=self._now())
         stats.sent += len(sent)
 
     async def _send_pending(
@@ -360,7 +409,7 @@ class Poller:
         stats: CycleStats | None = None,
         simplified_ids: set[int] | None = None,
     ) -> int:
-        """Отправить всё подходящее с `sent_at IS NULL` и пометить доставленное.
+        """Владельцу: отправить всё подходящее с `sent_at IS NULL` и пометить доставленное.
 
         Новые объявления цикла уже лежат в базе неотправленными (шаг 1 из раздела 4.2),
         поэтому заодно уходит то, что не удалось отправить раньше (сбой сети и т.п.).
@@ -386,6 +435,66 @@ class Poller:
                 if ad.ad_id in sent_set and ad.category_key in by_key:
                     by_key[ad.category_key].sent += 1
         return total
+
+    async def _send_friends(
+        self,
+        recipients: list[Recipient],
+        stats: CycleStats | None = None,
+        simplified_ids: set[int] | None = None,
+    ) -> int:
+        """Друзьям: каждому — подходящие ему и ещё не отправленные вакансии."""
+        total = 0
+        for recipient in recipients:
+            if recipient.chat_id == OWNER_ID or recipient.paused:
+                continue
+            total += await self.flush_friend(
+                recipient.chat_id, stats=stats, simplified_ids=simplified_ids
+            )
+        return total
+
+    async def flush_friend(
+        self,
+        chat_id: int,
+        since: datetime | None = None,
+        *,
+        stats: CycleStats | None = None,
+        simplified_ids: set[int] | None = None,
+    ) -> int:
+        """Отправить другу накопленное (цикл опроса, /resume). Возвращает число отправленных."""
+        ads = await self._storage.ready_for(chat_id, since or self._now() - UNSENT_WINDOW)
+        if not ads:
+            return 0
+        by_key = {s.key: s for s in stats.categories} if stats else {}
+        simplified_ids = simplified_ids or set()
+        total = 0
+        for simplified in (False, True):
+            group = [ad for ad in ads if (ad.ad_id in simplified_ids) is simplified]
+            if not group:
+                continue
+            sent = await self._notifier.send_ads(
+                group, self._titles, simplified=simplified, chat_id=chat_id
+            )
+            await self._storage.mark_delivered(chat_id, sent, now=self._now())
+            total += len(sent)
+            for ad in group:
+                if ad.ad_id in set(sent) and ad.category_key in by_key:
+                    by_key[ad.category_key].sent += 1
+        if chat_id in self._notifier.forbidden:
+            await self._friend_blocked_bot(chat_id)
+        return total
+
+    async def _friend_blocked_bot(self, chat_id: int) -> None:
+        """Друг заблокировал бота: больше не пытаемся писать, владельцу — одно сообщение."""
+        self._notifier.forbidden.discard(chat_id)
+        user = await self._storage.get_user(chat_id)
+        await self._storage.set_user_status(chat_id, "blocked")
+        name = html.escape(user.title if user else str(chat_id))
+        log.warning("пользователь %d заблокировал бота — отправка остановлена", chat_id)
+        await self._alert(
+            f"blocked_user:{chat_id}",
+            f"🚫 {name} заблокировал бота — вакансии ему больше не отправляются. "
+            "Включить снова: /admin → пользователь → «Возобновить».",
+        )
 
     # ---------- служебное ----------
 

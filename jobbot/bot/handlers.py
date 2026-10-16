@@ -14,8 +14,10 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from jobbot.bot.admin import create_admin_router
 from jobbot.bot.filters_menu import create_filters_router, filters_reply_keyboard
-from jobbot.bot.middleware import OwnerOnlyMiddleware
+from jobbot.bot.friends import create_friends_router
+from jobbot.bot.middleware import AccessMiddleware, Role
 from jobbot.config import Settings
 from jobbot.matcher import MAX_WORDS_PER_LIST, validate_keyword
 from jobbot.notifier import Notifier
@@ -53,7 +55,8 @@ HELP_TEXT = (
     "/exclude <i>слово</i> — добавить слово в exclude\n"
     "/remove <i>слово</i> — удалить слово из обоих списков\n"
     "/categories — включить/выключить разделы, режим all/keywords\n"
-    "/last [n] — последние n подходящих вакансий (1–20, по умолчанию 5)"
+    "/last [n] — последние n подходящих вакансий (1–20, по умолчанию 5)\n"
+    "/admin — друзья: добавить, настроить им фильтры, пауза, удалить"
 )
 
 START_TEXT = (
@@ -100,6 +103,9 @@ def resume_since(paused_at: str | None, now: datetime) -> datetime:
 
 def create_router(deps: BotDeps) -> Router:
     router = Router(name="owner-commands")
+    # Все команды этого роутера — только владельцу; друзьям отвечает роутер friends.
+    router.message.filter(Role("owner"))
+    router.callback_query.filter(Role("owner"))
     storage, settings = deps.storage, deps.settings
     titles = {c.key: c.title for c in settings.categories}
 
@@ -129,6 +135,7 @@ def create_router(deps: BotDeps) -> Router:
             f"Уведомления: {'⏸ на паузе' if paused else '✅ включены'}",
             f"Последний опрос: {format_local(await storage.get_state(STATE_LAST_POLL), tz)}",
             f"Объявлений в базе: {await storage.count_ads()}",
+            f"👥 Друзей: {len(await storage.list_users())} (/admin)",
             f"Отправлено сегодня: {sent_today}",
         ]
         blocked_until = await storage.get_state(STATE_BLOCKED_UNTIL)
@@ -330,9 +337,11 @@ def build_dispatcher(deps: BotDeps) -> Dispatcher:
     if owner_id is None:
         raise ValueError("OWNER_CHAT_ID не задан")
     dispatcher = Dispatcher()
-    guard = OwnerOnlyMiddleware(owner_id)
+    guard = AccessMiddleware(owner_id, deps.storage)
     dispatcher.message.outer_middleware(guard)
     dispatcher.callback_query.outer_middleware(guard)
     dispatcher.include_router(create_router(deps))
+    dispatcher.include_router(create_admin_router(deps))
     dispatcher.include_router(create_filters_router(deps))
+    dispatcher.include_router(create_friends_router(deps))
     return dispatcher
