@@ -17,7 +17,7 @@
 - **Этап:** v1.2.0 «друзья» — готов, релиз на Railway (2026-10-16). Осталась проверка владельцем в Telegram (v1.1: 9.6/9.9; v1.2: добавить друга, ограничить ему категории)
 - **Готово этапов:** v1.0: 9 из 9; v1.1: 7 из 9 (9.6, 9.9 ждут проверки в Telegram); v1.2: 6 из 6 (автотесты), ручная проверка ⏳
 - **Последнее обновление:** 2026-10-06
-- **Бот запущен в проде:** да — v1.1.0 (тег `v1.1.0`, коммит `6e233ec`), Railway `charismatic-vitality` / `somon-tj-vvew`, том `/app/data`; бот `@somontjvvew_bot`
+- **Бот запущен в проде:** да — v1.2.0 (тег `v1.2.0`, коммит `1e33199`), Railway `charismatic-vitality` / `somon-tj-vvew`, том `/app/data`; бот `@somontjvvew_bot`
 
 ## Следующий шаг
 
@@ -348,6 +348,7 @@ docker compose restart
 - Сделано: миграция v3 (`users`, `invites`, `access_requests`, `deliveries`); опрос для нескольких получателей (`Recipient`, отдельные решения по карточке и по странице объявления, доставка и досылка каждому, остановка для заблокировавших бота); `AccessMiddleware` с ролями и заявками; панель `/admin`; меню фильтров для профиля друга (владелец правит всё, друг — без категорий и только с разрешения); команды друга; README «Друзья»; раздел `restaurants` в `VISIBLE_CATEGORIES`.
 - Файлы: `jobbot/storage.py`, `jobbot/poller.py`, `jobbot/notifier.py` (`chat_id`, `forbidden`), `jobbot/bot/middleware.py`, `jobbot/bot/admin.py` (новый), `jobbot/bot/friends.py` (новый), `jobbot/bot/filters_menu.py` (переписан под `Target`), `jobbot/bot/handlers.py`, `README.md`, тесты `tests/test_users_poller.py`, `tests/test_admin.py` (новые), `tests/test_migration.py`, `tests/test_bot.py`, `tests/test_filters_menu.py`.
 - Проверка: `pytest` → 434 passed (было 399); `ruff check .`/`ruff format --check .` → чисто.
+- Деплой: `VISIBLE_CATEGORIES=it,students,restaurants` (`--skip-deploys`), `feature/users` → `main` (merge `1e33199`), тег `v1.2.0`, пуш; Railway собрал `main` сам. Smoke по логам: «разделов: 3», `копия базы перед миграцией: /app/data/backups/jobbot-20261016T085925Z.db`, `миграция базы: версия 3`, бот запущен, «it: найдено 60», «students: найдено 44», ошибок нет. Раздел `restaurants` не опрашивается, пока его никто не выбрал (по задумке). CI на `1e33199`: tests ✅, docker ✅.
 - Заметки: в логах прода до релиза видны 3 незнакомых chat_id (10:41–10:47 16.10: 5712508877, 7235153725, 5371602355) — вероятно друзья пробовали бота; после релиза их новые сообщения придут владельцу заявками.
 
 ### 2026-10-06 · v1.1.0 · 9.9 Релиз на Railway
